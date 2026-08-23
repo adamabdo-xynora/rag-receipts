@@ -5,3 +5,7 @@ dist/
 *.log
 .DS_Store
 coverage/
+
+# Eval run outputs. The verdict lives in CI, not in git history — see
+# DEFAULT_ARTIFACT_DIR in src/eval.ts.
+results/

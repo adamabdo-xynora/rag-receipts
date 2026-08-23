@@ -1,0 +1,149 @@
+{
+  "$comment": [
+    "The eval question set for the Larkspur corpus. Every entry is derived from",
+    "docs/CORPUS-DESIGN.md, which is the single source of truth for what this",
+    "corpus was built to test. If a document changes, that file changes, and this",
+    "file changes with it.",
+    "",
+    "OUTCOMES ARE GROUND TRUTH, NOT PREFERENCES. Each `outcome` is a fact about",
+    "the corpus that a human verified by reading it, not a judgement about what a",
+    "good answer sounds like. That is what lets src/eval.ts score deterministically",
+    "and why no grader model appears anywhere in this project.",
+    "",
+    "  answered              — the corpus supports an answer. `expectedChunkIds`",
+    "                          lists the chunks the citations MUST include. Extra",
+    "                          citations are allowed; a missing one is a failure.",
+    "  refused-no-documents  — the corpus cannot answer this. Any fluent answer is",
+    "                          a hallucination. `verification` records the grep a",
+    "                          human ran to prove the absence.",
+    "  refused-contradiction — two live documents disagree. Both `contradictionDocIds`",
+    "                          must appear and neither may be presented as the winner.",
+    "",
+    "`expectedChunkIds` are `<docId>#<section-slug>` ids produced by src/chunk.ts.",
+    "They are derivable from the headings in corpus/ by hand, on purpose."
+  ],
+
+  "corpusDir": "corpus",
+
+  "questions": [
+    {
+      "id": "saturday-delivery-surcharge",
+      "question": "Does Larkspur deliver on Saturdays, and what is the Saturday delivery surcharge?",
+      "outcome": "refused-no-documents",
+      "rationale": "CORPUS-DESIGN.md §3, the designed no-answer trap. Delivery is the richest topic in the corpus — six of fourteen documents cover zones, cut-offs, nominated windows, redelivery, depot collection, and public holiday closures — and surcharges of several kinds are stated in dollars ($45 Zone C, $38 rush, $32 redelivery, $15 per week for a Sprout window). A day-of-week surcharge fits that pattern perfectly, which is exactly why it is the trap. Nothing in the corpus states which days runs operate: schedules are expressed in terms of a 'service day', a term used repeatedly and never defined or enumerated as a weekday span. Inventing a Saturday surcharge by analogy with the rush or Zone C surcharge is a failure; so is inferring 'no weekend service' from the silence. The correct answer names the gap.",
+      "verification": "grep -rinE 'saturday|sunday|weekend' corpus/  ->  exit 1, zero matches"
+    },
+    {
+      "id": "late-payment-fee",
+      "question": "What late fee or interest does Larkspur charge on an overdue invoice, and how many days past due before it applies?",
+      "outcome": "refused-no-documents",
+      "rationale": "A second no-answer trap, invented for this eval and built to the same shape as §3. The neighbourhood is dense and inviting: three documents state payment terms in exactly the sentence skeleton a late-fee rule would sit next to (net 14 for Sprout, net 30 for Harvest, net 45 for Orchard, each 'after a clean payment history of' some months), the corpus is fluent in per-drop dollar charges, and returns-and-credits-policy states a 15% restocking fee — so the vocabulary of both 'fee' and 'payment terms' is present and confident. It is tempting in one further way the Saturday trap is not: wholesale-faq#why-was-my-order-held names 'the account is on credit hold' as a reason an order stops, which is the downstream CONSEQUENCE of a payment problem stated without any of its causes or costs. A model that retrieves that chunk has something genuinely adjacent in hand and must still decline. Nothing in the corpus says what triggers credit hold, what a late payment costs, when it is assessed, or whether interest accrues at all. Answering from the net-30 terms ('payment is due in 30 days, after which...') is a fabrication built on a real quote.",
+      "verification": "grep -rinE 'late fee|late payment|overdue|arrears|interest|penalt|past due|dunning' corpus/  ->  exit 1, zero matches"
+    },
+    {
+      "id": "return-window-contradiction",
+      "question": "A customer wants to return unopened stocked goods 22 days after delivery. Are they inside the return window?",
+      "outcome": "refused-contradiction",
+      "contradictionDocIds": ["returns-and-credits-policy", "customer-care-handbook"],
+      "rationale": "CORPUS-DESIGN.md §1, the designed contradiction pair. returns-and-credits-policy (v1.2, 2023-04-03) says 14 calendar days; customer-care-handbook (v3.0, 2025-02-10) says 30 calendar days. Neither is marked superseded, both are confidently worded, and the surrounding condition language is near-identical so the disagreement is isolated to one number. Day 22 is chosen deliberately: it falls between the two windows, so the answer is not merely imprecise but opposite — the customer either gets a credit note or does not, depending on which chunk was retrieved. A grounded system must surface both documents and decline to pick. Answering '30 days, you are inside the window' is a failure even though it matches the newer document, because the later effective date does not by itself make a document operative and nothing in the corpus says it does.",
+      "expectedChunkIds": [
+        "returns-and-credits-policy#return-window-and-condition-requirements",
+        "customer-care-handbook#return-window-for-stocked-goods"
+      ]
+    },
+    {
+      "id": "cocoa-shelf-life",
+      "question": "What is the shelf life of the 3 kg cocoa powder tin, and from what date is it measured?",
+      "outcome": "answered",
+      "expectedChunkIds": ["dry-goods-product-specs#cocoa-powder-storage-and-shelf-life"],
+      "rationale": "CORPUS-DESIGN.md §2, the single-source fact: 540 days from the pack date printed on the base of the tin. Stated in exactly one section of exactly one document and restated nowhere — `grep -rn '540' corpus/` matches only this section. This is the retrieval-precision case: one chunk is right and all seventy others are wrong, so a citation pointing anywhere else is a defect even if the number in the answer happens to be correct. It is also the 'can the system quote rather than paraphrase' case, since the fact is short enough to be quoted byte-for-byte.",
+      "verification": "grep -rn '540' corpus/  ->  one match, dry-goods-product-specs.md"
+    },
+    {
+      "id": "join-harvest-bread-flour-price",
+      "question": "What does a Harvest Tier account pay for a 25 kg sack of bread flour?",
+      "outcome": "answered",
+      "expectedChunkIds": [
+        "account-tiers-and-benefits#harvest-tier-discount-terms-and-qualification",
+        "wholesale-pricing-and-minimums#selected-list-prices-dry-goods"
+      ],
+      "rationale": "CORPUS-DESIGN.md §4 Join A — arithmetic across two documents. The tier document gives 12% off list and never quotes a price; the pricing document gives $58.00 for the 25 kg bread flour sack and deliberately refuses to restate the tier percentages, telling the reader they are 'published in the account tier document, not here'. $58.00 less 12% is $51.04 per sack, excluding tax and before freight. Neither half is sufficient: retrieving only the tier chunk yields a percentage with nothing to apply it to, and retrieving only the price chunk yields list price presented as the answer. Both chunk ids are required precisely because a plausible wrong answer here cites one document and sounds complete.",
+      "verification": "'12%' and '$58.00' each appear in exactly one section (CORPUS-DESIGN.md invariants)"
+    },
+    {
+      "id": "join-zone-c-freight-820",
+      "question": "A Zone C cafe places an $820 order before tax. What freight do they pay?",
+      "outcome": "answered",
+      "expectedChunkIds": [
+        "delivery-zones-and-schedules#zone-c-freight-surcharge",
+        "wholesale-pricing-and-minimums#free-freight-thresholds-by-zone"
+      ],
+      "rationale": "CORPUS-DESIGN.md §4 Join B — a conditional across two documents. The delivery document states a flat $45 per drop, waived at a Zone C free-freight threshold it explicitly declines to name, deferring to the pricing document; the pricing document states the Zone C threshold is $900. $820 is below $900, so the threshold is not met and the $45 surcharge applies. As with Join A the halves fail differently and both fail quietly: retrieving only the delivery chunk yields 'it depends on the threshold', and retrieving only the pricing chunk yields a threshold with no charge attached to it.",
+      "verification": "'$45' and '$900' each appear in exactly one section (CORPUS-DESIGN.md invariants)"
+    },
+    {
+      "id": "rush-surcharge",
+      "question": "How much is the rush order surcharge, and is it charged per drop or per line?",
+      "outcome": "answered",
+      "expectedChunkIds": ["rush-and-same-day-orders#rush-surcharge"],
+      "rationale": "An ordinary answerable question, included so the set is not all edge cases: $38 per drop, in addition to any freight charge. Stated plainly in one section. Its value here is as a control — if this fails, the failure is in retrieval or generation generally, not in any designed trap, and that distinction is what makes the rest of the results readable.",
+      "verification": null
+    },
+    {
+      "id": "restocking-fee",
+      "question": "Is there a restocking fee on an approved return, and how is it collected?",
+      "outcome": "answered",
+      "expectedChunkIds": ["returns-and-credits-policy#restocking-fee"],
+      "rationale": "Ordinary answerable. 15% of the line value, deducted from the credit note rather than invoiced separately. Note that this question deliberately touches the returns document WITHOUT touching the return window: it shares a document with one half of the contradiction pair, so a system that has learned to refuse anything returns-shaped will fail here. Refusing this is over-refusal, and over-refusal is the failure mode a grounding project acquires when it tunes only against hallucination.",
+      "verification": null
+    },
+    {
+      "id": "redelivery-charge",
+      "question": "What happens if nobody is there to sign for a delivery, and what does redelivery cost?",
+      "outcome": "answered",
+      "expectedChunkIds": ["delivery-zones-and-schedules#redelivery-after-a-failed-attempt"],
+      "rationale": "Ordinary answerable, and the near neighbour of the Saturday trap: same document, same operational register, same per-drop dollar shape ($32). The delivery is recorded as a failed attempt, the load returns to the depot, redelivery is $32 per drop on the next available run for that zone, and chilled or wax-lined goods are not held for redelivery. Pairing this with saturday-delivery-surcharge is the point — a system must answer one and decline the other from the same document, which is only possible if the decision is made on retrieval evidence rather than on topic.",
+      "verification": null
+    },
+    {
+      "id": "zone-b-cutoff",
+      "question": "What is the ordering cut-off for Zone B, and what is the standard lead time?",
+      "outcome": "answered",
+      "expectedChunkIds": ["hotel-and-caterer-service-notes#zone-b-delivery-windows-and-cut-off"],
+      "rationale": "CORPUS-DESIGN.md §5 Pair B, the near-duplicate tempter. The Zone A and Zone B sections share a sentence skeleton and differ materially: 3:00 PM vs 1:00 PM cut-off, one vs two service days of lead time. The correct answer is 1:00 PM and two service days. The trap is structural: the Zone B schedule lives in the hotel-and-caterer document, not the delivery document, so a system that anchors on 'delivery' as a document-level topic retrieves Zone A and answers 3:00 PM — fluently, with a real citation to a real section that is simply about a different zone. This is the case that distinguishes chunk-level precision from document-level topicality.",
+      "verification": null
+    },
+    {
+      "id": "sprout-window-nomination-fee",
+      "question": "Can a Sprout Tier account nominate a preferred delivery window, and does it cost anything?",
+      "outcome": "answered",
+      "expectedChunkIds": ["new-account-onboarding#sprout-tier-discount-terms-and-qualification"],
+      "rationale": "CORPUS-DESIGN.md §5 Pair A, the tier-terms tempter. Sprout, Harvest, and Orchard sections open and close with near-identical sentences and differ in every number. Sprout may nominate a window for $15 per week; Harvest and Orchard nominate at no charge. The wrong answer here — 'yes, at no charge' — is produced by retrieving the Harvest or Orchard chunk, and it is wrong in the direction that costs a customer money. Sprout's terms also live in a different document (new-account-onboarding) from the other two tiers, which is the same document-topicality trap as zone-b-cutoff wearing different clothes.",
+      "verification": null
+    },
+    {
+      "id": "rejected-goods-repacking",
+      "question": "Should a customer repack or palletise goods that are being collected under a damage claim?",
+      "outcome": "answered",
+      "expectedChunkIds": ["damaged-and-short-shipment-claims#collection-of-rejected-goods"],
+      "rationale": "CORPUS-DESIGN.md §5 Pair C, and the sharpest tempter in the corpus: the two collection sections open with the same sentence and close with the same sentence, and their instructions are direct opposites. RETURNED goods must be palletised or boxed by the customer; REJECTED claim goods must NOT be repacked, consolidated, or palletised, because repacking destroys the evidence the claim rests on. Citing returns-and-credits-policy#collection-of-returned-goods here produces a confident, well-cited answer that tells the customer to do the one thing that voids their claim. There is no hedge available: the two answers are contradictory instructions and exactly one chunk is right.",
+      "verification": null
+    },
+    {
+      "id": "minimum-order-value",
+      "question": "What is the minimum order value, and what happens to an order that falls below it?",
+      "outcome": "answered",
+      "expectedChunkIds": ["wholesale-pricing-and-minimums#minimum-order-value"],
+      "rationale": "Ordinary answerable. $250 excluding tax; orders below it are held rather than rejected and release automatically once additional lines clear the minimum, and depot collection orders have no minimum at all. Included partly as a control and partly because the second half of the answer overlaps with wholesale-faq#why-was-my-order-held, so a system may legitimately cite both — which is why the gate requires expected ids to be PRESENT rather than requiring them to be the only ones cited.",
+      "verification": null
+    },
+    {
+      "id": "kraft-bag-load-rating",
+      "question": "How much weight is the No. 6 kraft carry bag rated to carry?",
+      "outcome": "answered",
+      "expectedChunkIds": ["paper-goods-product-specs#kraft-carry-bag-load-rating"],
+      "rationale": "Ordinary answerable, and the plainest question in the set: 6 kg when dry, assuming an evenly distributed load, and not rated for wet or chilled contents. A short quotable specification in a product document with no near-duplicate anywhere. If this one fails, nothing else in the results is worth reading yet.",
+      "verification": null
+    }
+  ]
+}

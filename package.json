@@ -6,7 +6,8 @@
   "scripts": {
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
-    "demo": "tsx demo/demo.ts"
+    "demo": "tsx demo/demo.ts",
+    "eval": "tsx src/eval-cli.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "0.120.0"
