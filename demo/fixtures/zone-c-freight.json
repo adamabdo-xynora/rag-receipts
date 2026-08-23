@@ -1,0 +1,55 @@
+{
+  "$provenance": {
+    "status": "HAND-WRITTEN",
+    "notActually": "This is NOT a recording. No language model produced these claims. They were typed by a human, against the corpus text on disk, so that the demo has a deterministic generator response to replay offline.",
+    "why": "No API key and no network in CI, and a demo whose output changes run to run cannot be asserted on. The claims below are what a well-behaved generator SHOULD return for this question; they are not evidence that any generator did return it.",
+    "storedAs": "Structured claims, not recorded bytes. A real recording would store the model's response verbatim as a string, because whitespace and key order are part of what was actually said. Hand-written structure cannot pretend to that fidelity, so it does not try.",
+    "replacementRule": "When a live run happens, overwrite `response` with the model's actual output and change `status` to RECORDED, naming the model, the date, and the question. Until then this file says HAND-WRITTEN and the demo prints it.",
+    "checkedBy": "Nothing here is trusted. Every quote below is checked byte-for-byte against the chunk it cites by src/verify.ts when the demo runs. If a corpus edit breaks one, the demo fails loudly rather than printing a stale receipt.",
+    "question": "What is the Zone C freight surcharge per drop, and at what pre-tax order value is freight waived for Zone C?"
+  },
+  "response": {
+    "claims": [
+      {
+        "text": "Every Zone C drop carries a flat freight surcharge of $45, charged per drop rather than per line or per pallet.",
+        "status": "stated",
+        "citations": ["delivery-zones-and-schedules#zone-c-freight-surcharge"],
+        "supportingQuotes": [
+          {
+            "chunkId": "delivery-zones-and-schedules#zone-c-freight-surcharge",
+            "quote": "Every Zone C drop carries a flat freight surcharge of $45, applied per drop and not per line or per pallet."
+          }
+        ]
+      },
+      {
+        "text": "The Zone C free-freight threshold is $900 of pre-tax order value, evaluated per delivery drop.",
+        "status": "stated",
+        "citations": ["wholesale-pricing-and-minimums#free-freight-thresholds-by-zone"],
+        "supportingQuotes": [
+          {
+            "chunkId": "wholesale-pricing-and-minimums#free-freight-thresholds-by-zone",
+            "quote": "The thresholds are Zone A $400, Zone B $650, and Zone C $900."
+          }
+        ]
+      },
+      {
+        "text": "An $820 pre-tax Zone C order is below the $900 threshold, so the surcharge is not waived and the drop pays $45 freight.",
+        "status": "inferred",
+        "citations": [
+          "delivery-zones-and-schedules#zone-c-freight-surcharge",
+          "wholesale-pricing-and-minimums#free-freight-thresholds-by-zone"
+        ],
+        "supportingQuotes": [
+          {
+            "chunkId": "delivery-zones-and-schedules#zone-c-freight-surcharge",
+            "quote": "The surcharge is waived when the order reaches the Zone C free-freight threshold published in the pricing document."
+          },
+          {
+            "chunkId": "wholesale-pricing-and-minimums#free-freight-thresholds-by-zone",
+            "quote": "Freight is waived when the pre-tax order value reaches the threshold for the account's zone."
+          }
+        ]
+      }
+    ]
+  }
+}

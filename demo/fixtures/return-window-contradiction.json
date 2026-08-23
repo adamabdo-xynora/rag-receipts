@@ -1,0 +1,38 @@
+{
+  "$provenance": {
+    "status": "HAND-WRITTEN",
+    "notActually": "This is NOT a recording. No language model produced these claims. They were typed by a human, against the corpus text on disk, so that the demo has a deterministic generator response to replay offline.",
+    "why": "No API key and no network in CI, and a demo whose output changes run to run cannot be asserted on. The claims below are what a well-behaved generator SHOULD return for this question; they are not evidence that any generator did return it.",
+    "storedAs": "Structured claims, not recorded bytes. A real recording would store the model's response verbatim as a string, because whitespace and key order are part of what was actually said. Hand-written structure cannot pretend to that fidelity, so it does not try.",
+    "replacementRule": "When a live run happens, overwrite `response` with the model's actual output and change `status` to RECORDED, naming the model, the date, and the question. Until then this file says HAND-WRITTEN and the demo prints it.",
+    "checkedBy": "Nothing here is trusted. Both quotes are checked byte-for-byte by src/verify.ts, and the disagreement between them is found by src/answer.ts detectContradiction, at demo run time.",
+    "question": "How long is the return window for stocked goods, measured from the delivery date?",
+    "note": "Two claims, deliberately. detectContradiction is pairwise across claims: a single inferred claim citing both documents would be one claim, no pair would exist, and nothing would fire. That limit is documented in src/answer.ts and this fixture respects it rather than hiding it."
+  },
+  "response": {
+    "claims": [
+      {
+        "text": "The returns and credits policy sets the return window for stocked goods at 14 calendar days from the delivery date.",
+        "status": "stated",
+        "citations": ["returns-and-credits-policy#return-window-and-condition-requirements"],
+        "supportingQuotes": [
+          {
+            "chunkId": "returns-and-credits-policy#return-window-and-condition-requirements",
+            "quote": "Customers may request a return on stocked goods within 14 calendar days of the delivery date."
+          }
+        ]
+      },
+      {
+        "text": "The customer care handbook sets the return window for stocked goods at 30 calendar days from the delivery date.",
+        "status": "stated",
+        "citations": ["customer-care-handbook#return-window-for-stocked-goods"],
+        "supportingQuotes": [
+          {
+            "chunkId": "customer-care-handbook#return-window-for-stocked-goods",
+            "quote": "Customers may request a return on stocked goods within 30 calendar days of the delivery date."
+          }
+        ]
+      }
+    ]
+  }
+}
