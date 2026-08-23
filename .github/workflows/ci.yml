@@ -1,0 +1,42 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx tsc --noEmit
+      - run: npx vitest run
+      # The demo is also a smoke test. It asserts every step inline and exits
+      # nonzero on any miss, so running it here proves the whole pipeline —
+      # ingest, retrieve, verify, refuse, contradict, gate — on every push.
+      # Nothing in this job needs a key: the entire suite and the demo are
+      # offline by construction.
+      - run: npm run demo
+
+  # The live eval needs an embedding key and a generation key and costs real
+  # money, so it runs only on manual dispatch. Exit code 1 (gate FAIL) fails the
+  # job — that is the gate doing its work in CI rather than decorating a README.
+  eval:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run eval
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          VOYAGE_API_KEY: ${{ secrets.VOYAGE_API_KEY }}
