@@ -1,0 +1,11 @@
+# Keep the build context clean. A key that cannot enter the build context
+# cannot end up in a layer — .env stays out no matter what a future COPY does.
+node_modules
+.git
+results/
+.env
+.env.*
+dist/
+coverage/
+*.log
+.DS_Store

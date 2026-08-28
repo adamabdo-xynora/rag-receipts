@@ -63,6 +63,13 @@ The corpus is entirely invented: `@example.com` addresses, 555-01xx phone number
 
 Exit codes on the eval: 0 = gate PASS, 1 = gate FAIL, 2 = setup error. Each run writes an artifact to `results/` recording the policy alongside the verdict, so a stored FAIL stays interpretable next to the thresholds it was judged against.
 
+**In Docker.** The image preserves the same split. The `test` stage carries the full toolchain and runs the whole offline story — `npm test`, `npm run typecheck`, `npm run demo` all work in it, no keys. The default build is a lean runtime carrying only the compiled eval CLI, the corpus, and the question set; keys reach it through `docker run -e` at run time and nothing else — `.dockerignore` keeps `.env` out of the build context, so a key cannot end up in a layer.
+
+    docker build --target test -t rag-receipts:test .
+    docker run --rm rag-receipts:test npm test    # the same 240 offline tests
+    docker build -t rag-receipts .
+    docker run --rm -e ANTHROPIC_API_KEY -e VOYAGE_API_KEY rag-receipts
+
 **What is live and what is not.** The demo is honest about this at every step, and so is this README. Corpus loading, chunking, cosine similarity, threshold partitioning, and every verification check are real computation, and the retrieval floor has been calibrated against live `voyage-4` embeddings (`docs/EVAL-RUN-2026-08-28.md`). Generation has not: the responses replayed in the demo are **hand-written fixtures, not recordings** — no model has answered a question in this repo — and they're labelled as such in the files and in the output. The adversarial payloads are hand-written to fail. The live path exists and is one command away; it just isn't what runs in CI.
 
 **Stack.** TypeScript throughout, Vitest, two runtime dependencies: the Anthropic SDK for generation, and nothing else — Voyage embeddings travel over raw `fetch` with an injected transport. Anthropic publishes no embedding model and names [Voyage](https://platform.claude.com/docs/en/build-with-claude/embeddings) as its recommended provider, which is why the stack pairs the two. The vector index is in-memory by design: the enforcement story lives entirely above the store, and a database dependency would obscure rather than demonstrate it. **Adapting to pgvector** means replacing `buildIndex` and `search` in `src/retrieve.ts` — the `Embedder` interface, the threshold partition, and everything downstream are unchanged.
