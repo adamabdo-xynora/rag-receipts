@@ -58,9 +58,10 @@
  * to share vocabulary with the corpus, because a lexical embedder scores
  * paraphrase at nearly zero, and step 9 shows a real question genuinely
  * over-refused because of it. `MIN_SIMILARITY` is never lowered to make a step
- * look better. `src/retrieve.ts` says the floor is a property of the embedder
- * and that 0.35 is a guess; that is a live limitation of this repository, and
- * a demo that tuned around it would be lying about the state of the work.
+ * look better. `src/retrieve.ts` says the floor is a property of the embedder,
+ * and its 0.4364 was measured against the live voyage-4 embedder — not against
+ * this lexical stand-in, whose absolute scores mean nothing on that scale. A
+ * demo that tuned around that would be lying about the state of the work.
  */
 
 import { readFile } from "node:fs/promises";

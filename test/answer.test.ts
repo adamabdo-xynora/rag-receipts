@@ -195,7 +195,7 @@ const COCOA = "dry-goods-product-specs#cocoa-powder-storage-and-shelf-life";
 /** Retrieves both sides of the contradiction pair above the floor. */
 const RETURN_WINDOW_QUESTION =
   "How long is the return window for stocked goods, measured from the delivery date?";
-/** Retrieves the cocoa chunk, and only one of the two return-window chunks. */
+/** Retrieves exactly one chunk above the floor: the cocoa chunk itself. */
 const COCOA_QUESTION = "What is the shelf life of the 3 kg cocoa powder tin?";
 /** The corpus cannot answer this: the word never appears in it, by design. */
 const UNANSWERABLE_QUESTION = "Do you deliver on Saturday?";
@@ -268,12 +268,15 @@ describe("the similarity floor decides whether the generator runs at all", () =>
 
 describe("the prompt carries real chunk ids, and asks for JSON only", () => {
   it("labels every retrieved chunk with its exact id and verbatim text", async () => {
-    const above = await aboveFloor(COCOA_QUESTION);
+    // The return-window question, not the cocoa one: this test needs a
+    // multi-chunk retrieval so the loop below is exercised across chunks, and
+    // the return-window question puts both sides of its pair above the floor.
+    const above = await aboveFloor(RETURN_WINDOW_QUESTION);
     expect(above.length).toBeGreaterThan(1);
 
-    const user = buildUserMessage(COCOA_QUESTION, above);
+    const user = buildUserMessage(RETURN_WINDOW_QUESTION, above);
 
-    expect(user).toContain(COCOA_QUESTION);
+    expect(user).toContain(RETURN_WINDOW_QUESTION);
     for (const result of above) {
       expect(user).toContain(`chunkId: ${result.chunk.chunkId}`);
       // Verbatim, because the verifier checks quotes against these bytes.

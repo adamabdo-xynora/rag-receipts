@@ -696,8 +696,9 @@ function subjectOverlap(a: readonly string[], b: readonly string[]): number {
 /**
  * Two shared subject words. Below this, any two claims mentioning a number of
  * days look like a conflict; much above it, two documents that disagree while
- * using different vocabulary stop being seen. It is a threshold with the same
- * status as `MIN_SIMILARITY`: a defensible starting point, not a measured one.
+ * using different vocabulary stop being seen. It is a threshold with the
+ * status `MIN_SIMILARITY` used to have before its calibration run: a
+ * defensible starting point, not a measured one.
  */
 const MIN_SUBJECT_OVERLAP = 2;
 

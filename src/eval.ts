@@ -1586,12 +1586,12 @@ export function describeDistribution(values: readonly number[]): Distribution {
 /**
  * Score every chunk against every question and split the scores by ground truth.
  *
- * THIS IS WHAT THE `TODO(eval)` IN `retrieve.ts` POINTS AT. `MIN_SIMILARITY` is
- * currently 0.35, chosen by reasoning about where a general-purpose embedding
- * model puts unrelated text — which is a guess with a comment on it, and the
- * comment says so. The floor separating "worth showing the model" from "the
- * search found nothing" is an empirical property of the embedder, and this is
- * the measurement that would fix it.
+ * THIS IS THE MEASUREMENT `MIN_SIMILARITY` RESTS ON. The constant in
+ * `retrieve.ts` was set from a live run of this calibration (voyage-4,
+ * 2026-08-28), and its header comment records the run's numbers. The floor
+ * separating "worth showing the model" from "the search found nothing" is an
+ * empirical property of the embedder, and this is the measurement that fixed
+ * it — and the one to re-run before moving it again.
  *
  * THE SPLIT. For an `answered` or `refused-contradiction` question, the chunks
  * in `expectedChunkIds` are the correct retrievals and every other chunk in the

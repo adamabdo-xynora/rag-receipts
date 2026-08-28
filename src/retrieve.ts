@@ -508,27 +508,55 @@ export async function search(
  * plausibly on-topic and is worth showing to the model; below it, the search
  * found nothing, however many rows it returned.
  *
- * THE SPECIFIC NUMBER IS PROVISIONAL. 0.35 is a starting point, not a measured
- * result. It was chosen to sit above where unrelated text lands and below where
- * a genuine topical match lands for a general-purpose retrieval embedding
- * model, and that is the entire derivation — no calibration set has been run
- * against it yet. Treat it as a placeholder that fails in the safe direction:
- * too high refuses answerable questions (visible, annoying, harmless), too low
- * lets an ungrounded answer through (invisible, and the thing this project
- * exists to prevent).
+ * THE SPECIFIC NUMBER IS MEASURED. 0.4364 comes from a live calibration run
+ * against `voyage-4` on 2026-08-28 — `npm run eval -- --calibrate`, artifact in
+ * `results/`, gitignored. The run scored every chunk against every eval
+ * question and split the scores by ground truth:
+ *
+ *   correct retrievals   n=15    min 0.5106   median 0.6109   max 0.7714
+ *   wrong retrievals     n=979   min 0.0036   median 0.2052   max 0.5843
+ *
+ * WHY THE BAND IS THE RIGHT CONSTRAINT. The naive separation does not exist:
+ * the worst correct retrieval (0.5106) sits below the best wrong one overall
+ * (0.5843), so no floor puts every correct score above every wrong one. But
+ * the two kinds of wrong retrieval are not the same failure. A wrong chunk
+ * retrieved for an ANSWERABLE question is a precision cost the pipeline
+ * absorbs downstream — the gate allows extra citations, and the verifier still
+ * requires the expected chunks and byte-exact quotes. A wrong chunk retrieved
+ * for a MUST-REFUSE question is different in kind: it is the only route to a
+ * headline failure, because it is what puts material in front of a generator
+ * for a question the corpus cannot answer. So the floor is constrained by the
+ * must-refuse ceiling below and the worst correct retrieval above, and both of
+ * those are measured:
+ *
+ *   best chunk for any must-refuse question   0.3622
+ *     (saturday-delivery-surcharge / rush-and-same-day-orders#rush-surcharge)
+ *   second must-refuse                        0.3600
+ *     (late-payment-fee / account-tiers-and-benefits#the-three-tiers)
+ *   worst correct retrieval                   0.5106
+ *     (join-zone-c-freight-820 /
+ *      wholesale-pricing-and-minimums#free-freight-thresholds-by-zone)
+ *
+ * WHY THE MIDPOINT. 0.4364 is equidistant from both measured failures rather
+ * than tuned to either, and at n=15 correct retrievals no point inside the
+ * band is more defensible than any other.
+ *
+ * WHAT THE OLD GUESS WAS DOING WRONG. The previous value, 0.35, sat BELOW the
+ * must-refuse ceiling of 0.3622: the rush-surcharge chunk was clearing the
+ * floor for the Saturday question and reaching the generator. The guess failed
+ * in the unsafe direction its own comment said it must not.
  *
  * IT IS A PROPERTY OF THE EMBEDDER, NOT OF THE CORPUS. Different models put
  * their "unrelated" mass at different similarities. Changing the embedding
- * model invalidates this constant outright; it does not merely shift it.
+ * model invalidates this constant outright; it does not merely shift it. And
+ * it is now also a property of THIS question set at n=15, so a materially
+ * different corpus invalidates it just as a model change does.
  *
- * TODO(eval): `src/eval.ts` is the module that will replace this guess with a
- * measured value. It should run the eval question set — including the question
- * the corpus deliberately cannot answer — against the live embedder, report the
- * score distribution of correct hits against wrong ones, and pick the floor
- * that separates them. Until that lands, this number is a guess with a comment
- * on it, and it should be read as one.
+ * TO RE-MEASURE: `npm run eval -- --calibrate` runs this calibration against
+ * the live embedder and writes the artifact to `results/`. Moving this
+ * constant remains a separate reviewed commit.
  */
-export const MIN_SIMILARITY = 0.35;
+export const MIN_SIMILARITY = 0.4364;
 
 /** Search results split by the floor. Both sides keep their ranked order. */
 export interface ThresholdPartition {

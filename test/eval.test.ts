@@ -480,7 +480,7 @@ describe("scoring: a correct refusal is a pass", () => {
     const question = questionById("saturday-delivery-surcharge");
     const score = scoreQuestion(
       question,
-      refusedWith("no-relevant-documents", "nothing reached the floor of 0.3500"),
+      refusedWith("no-relevant-documents", "nothing reached the floor of 0.4364"),
     );
 
     expect(score.passed).toBe(true);
