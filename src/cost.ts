@@ -25,7 +25,7 @@
 export const EMBEDDING_PRICED_MODEL = "voyage-4";
 
 /**
- * USD per one million input tokens for `voyage-3`.
+ * USD per one million input tokens for `voyage-4`.
  *
  * $0.06 / 1M tokens, AS OF 2026-08-27, read from the public pricing page
  * https://docs.voyageai.com/docs/pricing (Text Embeddings table).

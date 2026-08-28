@@ -21,16 +21,22 @@ import type { Claim } from "../src/verify.js";
 import type { Embedder, EmbeddingKind, VectorIndex } from "../src/retrieve.js";
 import { MIN_SIMILARITY, buildIndex } from "../src/retrieve.js";
 import {
+  type CalibrationRunMetadata,
+  type CalibrationSample,
   type EvalQuestion,
   type QuestionScore,
   type RunMetadata,
   ARTIFACT_SCHEMA_VERSION,
+  BOUNDARY_HIGHEST_WRONG_COUNT,
+  BOUNDARY_LOWEST_CORRECT_COUNT,
+  CALIBRATION_ARTIFACT_SCHEMA_VERSION,
   GATE_POLICY,
   HEADLINE_FAILURE_KINDS,
   OUTCOMES,
   QuestionSetError,
   applyGate,
   buildArtifact,
+  buildCalibrationArtifact,
   calibrateThreshold,
   describeDistribution,
   evidenceFrom,
@@ -41,8 +47,11 @@ import {
   parseQuestionSet,
   runEvaluation,
   scoreQuestion,
+  selectBoundaryCases,
   writeArtifact,
+  writeCalibrationArtifact,
 } from "../src/eval.js";
+import { EMBEDDING_PRICE_AS_OF, computeEmbeddingCost } from "../src/cost.js";
 import {
   type ConsoleLike,
   type Environment,
@@ -1036,6 +1045,237 @@ describe("calibration", () => {
     expect(overlapping.median).toBeCloseTo(0.5);
     expect(overlapping.count).toBe(3);
     expect(describeDistribution([]).count).toBe(0);
+  });
+
+  it("names the boundary cases and keeps them consistent with the distributions", async () => {
+    const plan = idealPlan(questions);
+    const embedder = createOracleEmbedder(chunks, questions, plan);
+    const index = await buildIndex(chunks, embedder);
+
+    const report = await calibrateThreshold(questions, index, embedder);
+    const { lowestCorrect, highestWrong } = report.boundary;
+
+    expect(lowestCorrect).toHaveLength(
+      Math.min(BOUNDARY_LOWEST_CORRECT_COUNT, report.correct.count),
+    );
+    expect(highestWrong).toHaveLength(
+      Math.min(BOUNDARY_HIGHEST_WRONG_COUNT, report.wrong.count),
+    );
+
+    // The boundary rows are the named ends of the two distributions: the
+    // worst correct row carries the correct min, the best wrong row the
+    // wrong max, and every row keeps its ground-truth side.
+    expect(must(lowestCorrect[0], "the worst correct sample").score).toBe(report.correct.min);
+    expect(must(highestWrong[0], "the best wrong sample").score).toBe(report.wrong.max);
+    expect(lowestCorrect.every((sample) => sample.correct)).toBe(true);
+    expect(highestWrong.every((sample) => !sample.correct)).toBe(true);
+  });
+
+  it("prints the boundary cases in the report, score first, ids after", async () => {
+    const plan = idealPlan(questions);
+    const embedder = createOracleEmbedder(chunks, questions, plan);
+    const index = await buildIndex(chunks, embedder);
+
+    const report = await calibrateThreshold(questions, index, embedder);
+    const printed = formatCalibrationReport(report);
+
+    expect(printed).toContain("LOWEST-SCORING CORRECT RETRIEVALS");
+    expect(printed).toContain("HIGHEST-SCORING WRONG RETRIEVALS");
+
+    // Each named row appears in the near-miss shape: aligned score to four
+    // places, then the ids — so the section reads like the rest of the
+    // project's output.
+    const worst = must(report.boundary.lowestCorrect[0], "the worst correct sample");
+    const line = printed
+      .split("\n")
+      .find((candidate) => candidate.includes(worst.chunkId) && candidate.includes(worst.questionId));
+    expect(must(line, "the printed boundary row")).toContain(worst.score.toFixed(4));
+    const scoreAt = must(line, "the printed boundary row").indexOf(worst.score.toFixed(4));
+    expect(scoreAt).toBeLessThan(must(line, "the printed boundary row").indexOf(worst.questionId));
+  });
+});
+
+/* ===========================================================================
+ * Boundary-case selection, directly.
+ * ======================================================================== */
+
+describe("selectBoundaryCases", () => {
+  function sample(
+    questionId: string,
+    chunkId: string,
+    score: number,
+    correct: boolean,
+  ): CalibrationSample {
+    return {
+      questionId,
+      outcome: correct ? "answered" : "refused-no-documents",
+      chunkId,
+      score,
+      correct,
+    };
+  }
+
+  it("takes the bottom correct ascending and the top wrong descending", () => {
+    const boundary = selectBoundaryCases([
+      sample("q-a", "doc#one", 0.77, true),
+      sample("q-b", "doc#two", 0.51, true),
+      sample("q-c", "doc#three", 0.61, true),
+      sample("q-d", "doc#four", 0.65, true),
+      sample("q-e", "doc#five", 0.58, false),
+      sample("q-f", "doc#six", 0.2, false),
+      sample("q-g", "doc#seven", 0.39, false),
+      sample("q-h", "doc#eight", 0.01, false),
+      sample("q-i", "doc#nine", 0.44, false),
+      sample("q-j", "doc#ten", 0.03, false),
+    ]);
+
+    expect(boundary.lowestCorrect.map((entry) => entry.chunkId)).toEqual([
+      "doc#two",
+      "doc#three",
+      "doc#four",
+    ]);
+    expect(boundary.highestWrong.map((entry) => entry.chunkId)).toEqual([
+      "doc#five",
+      "doc#nine",
+      "doc#seven",
+      "doc#six",
+      "doc#ten",
+    ]);
+  });
+
+  it("breaks score ties by question id then chunk id, so two runs name the same rows", () => {
+    // Every score identical: the order is decided entirely by the tie-break.
+    const tied = [
+      sample("q-b", "doc#b", 0.5, true),
+      sample("q-a", "doc#z", 0.5, true),
+      sample("q-a", "doc#a", 0.5, true),
+      sample("q-c", "doc#c", 0.5, true),
+      sample("q-b", "doc#w", 0.3, false),
+      sample("q-a", "doc#w", 0.3, false),
+    ];
+
+    const boundary = selectBoundaryCases(tied);
+    expect(
+      boundary.lowestCorrect.map((entry) => `${entry.questionId} ${entry.chunkId}`),
+    ).toEqual(["q-a doc#a", "q-a doc#z", "q-b doc#b"]);
+    expect(
+      boundary.highestWrong.map((entry) => `${entry.questionId} ${entry.chunkId}`),
+    ).toEqual(["q-a doc#w", "q-b doc#w"]);
+
+    // Selection reads the sample list; it does not reorder it.
+    expect(tied.map((entry) => entry.chunkId)).toEqual([
+      "doc#b",
+      "doc#z",
+      "doc#a",
+      "doc#c",
+      "doc#w",
+      "doc#w",
+    ]);
+  });
+
+  it("returns what exists when a side has fewer samples than asked for", () => {
+    const boundary = selectBoundaryCases([
+      sample("q-a", "doc#one", 0.7, true),
+      sample("q-b", "doc#two", 0.6, true),
+      sample("q-c", "doc#three", 0.1, false),
+    ]);
+    expect(boundary.lowestCorrect).toHaveLength(2);
+    expect(boundary.highestWrong).toHaveLength(1);
+
+    const empty = selectBoundaryCases([]);
+    expect(empty.lowestCorrect).toEqual([]);
+    expect(empty.highestWrong).toEqual([]);
+  });
+});
+
+/* ===========================================================================
+ * The calibration artifact.
+ * ======================================================================== */
+
+describe("the calibration artifact", () => {
+  const metadata: CalibrationRunMetadata = {
+    generatedAt: "2026-08-27T11:00:00.000Z",
+    embedder: "fake-oracle",
+    corpusDir: "corpus",
+    chunkCount: 71,
+    questionCount: 14,
+  };
+
+  async function calibrated() {
+    const plan = idealPlan(questions);
+    const embedder = createOracleEmbedder(chunks, questions, plan);
+    const index = await buildIndex(chunks, embedder);
+    return calibrateThreshold(questions, index, embedder);
+  }
+
+  it("is self-contained: statistics, boundary cases, model, prices, and the unchanged constant", async () => {
+    const report = await calibrated();
+    const usage = { totalTokens: 123_456, calls: 15, totalLatencyMs: 890 };
+    const artifact = buildCalibrationArtifact(report, metadata, usage);
+
+    expect(artifact.schemaVersion).toBe(CALIBRATION_ARTIFACT_SCHEMA_VERSION);
+    expect(artifact.run).toEqual(metadata);
+    expect(artifact.correct).toEqual(report.correct);
+    expect(artifact.wrong).toEqual(report.wrong);
+    expect(artifact.separation).toEqual(report.separation);
+    expect(artifact.boundary).toEqual(report.boundary);
+
+    // The constant is recorded, not moved, and the file says so on its own.
+    expect(artifact.currentThreshold).toBe(MIN_SIMILARITY);
+    expect(artifact.thresholdNote).toContain("does not change MIN_SIMILARITY");
+    expect(artifact.thresholdNote).toContain("reviewed commit");
+
+    // The usage block: the provider's numbers at the committed price, with
+    // the priced model and its as-of date beside the ran model in `run`.
+    const billed = must(artifact.usage, "the usage block");
+    expect(billed.embeddingTokens).toBe(123_456);
+    expect(billed.embeddingCalls).toBe(15);
+    expect(billed.latencyMs).toBe(890);
+    expect(billed.costUsd).toBe(computeEmbeddingCost(123_456));
+    expect(billed.pricing.asOf).toBe(EMBEDDING_PRICE_AS_OF);
+  });
+
+  it("records null usage for an uninstrumented run, not a fabricated zero", async () => {
+    const artifact = buildCalibrationArtifact(await calibrated(), metadata);
+    expect(artifact.usage).toBeNull();
+  });
+
+  it("carries no credential-shaped field", async () => {
+    const report = await calibrated();
+    const artifact = buildCalibrationArtifact(report, metadata, {
+      totalTokens: 1,
+      calls: 1,
+      totalLatencyMs: 1,
+    });
+    const serialised = JSON.stringify(artifact);
+    expect(serialised).toContain("fake-oracle");
+    expect(serialised).toContain(EMBEDDING_PRICE_AS_OF);
+    expect(serialised).not.toContain("apiKey");
+    expect(serialised).not.toContain("API_KEY");
+    expect(serialised).not.toContain(DECOY_KEY);
+  });
+
+  it("writes a timestamped copy and a latest copy, both self-contained", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "rag-receipts-calibration-"));
+    try {
+      const artifact = buildCalibrationArtifact(await calibrated(), metadata);
+      const written = await writeCalibrationArtifact(directory, artifact);
+
+      expect(written).toHaveLength(2);
+      expect(path.basename(must(written[0], "the stamped path"))).toMatch(/^calibration-2026/);
+      expect(must(written[1], "the latest path").endsWith("calibration-latest.json")).toBe(true);
+
+      for (const file of written) {
+        const parsed: unknown = JSON.parse(await readFile(file, "utf8"));
+        const record = parsed as { currentThreshold: number; thresholdNote: string };
+        // Read alone, months later, the file still says what it measured and
+        // what it deliberately did not touch.
+        expect(record.currentThreshold).toBe(MIN_SIMILARITY);
+        expect(record.thresholdNote).toContain("does not change MIN_SIMILARITY");
+      }
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
   });
 });
 

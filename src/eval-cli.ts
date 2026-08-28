@@ -53,17 +53,20 @@ import { readFile } from "node:fs/promises";
 import { anthropicGenerator } from "./answer.js";
 import { loadCorpus } from "./chunk.js";
 import {
+  type CalibrationRunMetadata,
   type EvalQuestion,
   type RunMetadata,
   DEFAULT_ARTIFACT_DIR,
   applyGate,
   buildArtifact,
+  buildCalibrationArtifact,
   calibrateThreshold,
   formatCalibrationReport,
   formatGateReport,
   loadQuestionSet,
   runInstrumentedEvaluation,
   writeArtifact,
+  writeCalibrationArtifact,
 } from "./eval.js";
 import { MIN_SIMILARITY, buildIndex, voyageEmbedder } from "./retrieve.js";
 import { DEFAULT_K } from "./answer.js";
@@ -339,7 +342,8 @@ export const USAGE = [
   `                correct retrievals against wrong ones, so MIN_SIMILARITY can be set from`,
   `                data instead of from reasoning. Requires VOYAGE_API_KEY only: no answer is`,
   `                generated, so no generation key is needed and none is asked for.`,
-  `                This prints a recommendation and changes nothing.`,
+  `                Writes the report to ${DEFAULT_ARTIFACT_DIR}/ (a timestamped copy and a latest copy),`,
+  `                and changes no constant: moving MIN_SIMILARITY is a reviewed commit.`,
   ``,
   `Environment (process environment first, then .env at the repository root):`,
   `  VOYAGE_API_KEY       required`,
@@ -482,16 +486,39 @@ export async function main(options: MainOptions): Promise<number> {
   // ---- calibration -------------------------------------------------------
 
   if (args.calibrate) {
+    let calibration;
     try {
-      const report = await calibrateThreshold(questions, index, embedder);
+      calibration = await calibrateThreshold(questions, index, embedder);
       // The cumulative usage at this point is the whole calibration bill:
       // the index build plus one query embedding per question, nothing else.
-      out.log(formatCalibrationReport(report, embedder.usage()));
-      return EXIT_PASS;
+      out.log(formatCalibrationReport(calibration, embedder.usage()));
     } catch (error) {
       out.error(`Calibration could not complete: ${describeError(error)}`);
       return EXIT_SETUP_ERROR;
     }
+
+    const calibrationMetadata: CalibrationRunMetadata = {
+      generatedAt: now,
+      embedder: embeddingModel,
+      corpusDir,
+      chunkCount,
+      questionCount: questions.length,
+    };
+
+    try {
+      const written = await writeCalibrationArtifact(
+        paths.resultsDir,
+        buildCalibrationArtifact(calibration, calibrationMetadata, embedder.usage()),
+      );
+      out.log("");
+      for (const file of written) out.log(`artifact: ${file}`);
+    } catch (error) {
+      // Same treatment as the gate: the report above already printed, and a
+      // lost file does not change what the measurement found.
+      out.error(`The report above stands, but the artifact could not be written: ${describeError(error)}`);
+    }
+
+    return EXIT_PASS;
   }
 
   // ---- the gate ----------------------------------------------------------

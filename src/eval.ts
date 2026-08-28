@@ -1314,7 +1314,7 @@ function filenameStamp(iso: string): string {
 }
 
 /**
- * Write the artifact twice: once under a timestamp, once as `latest`.
+ * Write a JSON record twice: once under a timestamp, once as `latest`.
  *
  * The timestamped copy is the record — artifacts accumulate, and two of them
  * side by side are how a threshold change or a regression becomes visible. The
@@ -1324,20 +1324,30 @@ function filenameStamp(iso: string): string {
  *
  * Returns both paths, in write order.
  */
-export async function writeArtifact(
+async function writeArtifactPair(
   directory: string,
-  artifact: EvalArtifact,
+  prefix: string,
+  generatedAt: string,
+  record: unknown,
 ): Promise<readonly string[]> {
   await mkdir(directory, { recursive: true });
-  const body = `${JSON.stringify(artifact, null, 2)}\n`;
+  const body = `${JSON.stringify(record, null, 2)}\n`;
 
-  const stamped = path.join(directory, `eval-${filenameStamp(artifact.run.generatedAt)}.json`);
-  const latest = path.join(directory, "eval-latest.json");
+  const stamped = path.join(directory, `${prefix}-${filenameStamp(generatedAt)}.json`);
+  const latest = path.join(directory, `${prefix}-latest.json`);
 
   await writeFile(stamped, body, "utf8");
   await writeFile(latest, body, "utf8");
 
   return [stamped, latest];
+}
+
+/** The gate's verdict, persisted. See `writeArtifactPair` for the two copies. */
+export async function writeArtifact(
+  directory: string,
+  artifact: EvalArtifact,
+): Promise<readonly string[]> {
+  return writeArtifactPair(directory, "eval", artifact.run.generatedAt, artifact);
 }
 
 /* ===========================================================================
@@ -1385,12 +1395,77 @@ export interface Separation {
   readonly verdict: string;
 }
 
+/**
+ * How many boundary cases the report names on each side.
+ *
+ * The numbers are asymmetric because the decisions they inform are. The bottom
+ * correct retrievals are the price of any floor high enough to matter — three
+ * is enough to see whether they share a question (one hard paraphrase) or a
+ * pattern (the floor is squeezing everything). The top wrong retrievals are the
+ * candidates a floor must clear, and the gap between the fifth and the first
+ * says whether the danger is one outlier or a shelf.
+ */
+export const BOUNDARY_LOWEST_CORRECT_COUNT = 3;
+export const BOUNDARY_HIGHEST_WRONG_COUNT = 5;
+
+/**
+ * The named chunks at the overlap boundary.
+ *
+ * The distributions say WHETHER the two sides overlap; these rows say WHO is
+ * in the overlap. A floor cannot be chosen from summary statistics alone —
+ * "the worst correct chunk scores 0.5106" is a different fact when that chunk
+ * is the hardest paraphrase in the corpus than when it is a routine retrieval,
+ * and only the id tells the reader which.
+ */
+export interface BoundaryCases {
+  /** The lowest-scoring correct retrievals, worst first. */
+  readonly lowestCorrect: readonly CalibrationSample[];
+  /** The highest-scoring wrong retrievals, best first. */
+  readonly highestWrong: readonly CalibrationSample[];
+}
+
+/** Codepoint order on (questionId, chunkId) — same rule as `search`'s tie-break. */
+function compareSampleIds(a: CalibrationSample, b: CalibrationSample): number {
+  if (a.questionId !== b.questionId) return a.questionId < b.questionId ? -1 : 1;
+  return a.chunkId < b.chunkId ? -1 : a.chunkId > b.chunkId ? 1 : 0;
+}
+
+/**
+ * Pick the boundary cases out of the sample grid.
+ *
+ * Equal scores are broken by question id then chunk id, in codepoint order,
+ * for the reason `search` breaks ties by chunk id: the corpus is full of
+ * near-duplicate passages that genuinely tie, and a report that names
+ * different chunks on different runs of the same data cannot be diffed.
+ * Fewer samples than asked for returns what exists — the counts are report
+ * sizes, not requirements.
+ */
+export function selectBoundaryCases(
+  samples: readonly CalibrationSample[],
+  lowestCorrectCount: number = BOUNDARY_LOWEST_CORRECT_COUNT,
+  highestWrongCount: number = BOUNDARY_HIGHEST_WRONG_COUNT,
+): BoundaryCases {
+  const correct = samples
+    .filter((sample) => sample.correct)
+    .sort((a, b) => (a.score !== b.score ? a.score - b.score : compareSampleIds(a, b)));
+  const wrong = samples
+    .filter((sample) => !sample.correct)
+    .sort((a, b) => (a.score !== b.score ? b.score - a.score : compareSampleIds(a, b)));
+
+  return {
+    lowestCorrect: correct.slice(0, lowestCorrectCount),
+    highestWrong: wrong.slice(0, highestWrongCount),
+  };
+}
+
 /** The whole calibration run. */
 export interface CalibrationReport {
   readonly samples: readonly CalibrationSample[];
   readonly correct: Distribution;
   readonly wrong: Distribution;
   readonly separation: Separation;
+  /** The named chunks at the overlap boundary. See `BoundaryCases`. */
+  readonly boundary: BoundaryCases;
   /** The constant this report exists to inform. Reported, never modified. */
   readonly currentThreshold: number;
 }
@@ -1510,6 +1585,7 @@ export async function calibrateThreshold(
     correct: describeDistribution(correctScores),
     wrong: describeDistribution(wrongScores),
     separation,
+    boundary: selectBoundaryCases(samples),
     currentThreshold: MIN_SIMILARITY,
   };
 }
@@ -1541,6 +1617,21 @@ function describeSeparation(
 
 function stat(value: number): string {
   return Number.isNaN(value) ? "   n/a" : value.toFixed(4);
+}
+
+/**
+ * One boundary list, in the same shape as the demo's near-miss lists: a
+ * right-aligned position, the score to four places, then the ids. The score
+ * comes first because the score is the decision — the reader scans the column
+ * to find where the floor would cut, then reads across to see who it cuts.
+ */
+function formatBoundaryList(samples: readonly CalibrationSample[]): string[] {
+  if (samples.length === 0) return [`    (none)`];
+  const width = Math.max(...samples.map((sample) => sample.questionId.length));
+  return samples.map(
+    (sample, position) =>
+      `    ${String(position + 1).padStart(2)}. ${sample.score.toFixed(4)}  ${padRight(sample.questionId, width)}  ${sample.chunkId}`,
+  );
 }
 
 /**
@@ -1587,9 +1678,136 @@ export function formatCalibrationReport(
     ``,
     `  ${report.separation.verdict}`,
     ``,
+    `  LOWEST-SCORING CORRECT RETRIEVALS (bottom ${report.boundary.lowestCorrect.length} of ${report.correct.count}) — what a higher floor starts refusing`,
+    ...formatBoundaryList(report.boundary.lowestCorrect),
+    ``,
+    `  HIGHEST-SCORING WRONG RETRIEVALS (top ${report.boundary.highestWrong.length} of ${report.wrong.count}) — what a lower floor starts admitting`,
+    ...formatBoundaryList(report.boundary.highestWrong),
+    ``,
     `  This report does not change MIN_SIMILARITY. The floor is a property of the embedding`,
     `  model, so a number measured against anything but the live embedder is a number about`,
     `  the wrong thing. Moving it is a reviewed commit to src/retrieve.ts.`,
     ...usageSection,
   ].join("\n");
+}
+
+/* ===========================================================================
+ * The calibration artifact.
+ * ======================================================================== */
+
+/**
+ * Versioned separately from `ARTIFACT_SCHEMA_VERSION` because the two files
+ * answer different questions and change for different reasons: the gate
+ * artifact records a verdict against a policy, this one records a measurement
+ * against a constant. Bumped when the shape changes in a way that would
+ * mislead a reader comparing two calibration files.
+ */
+export const CALIBRATION_ARTIFACT_SCHEMA_VERSION = 1;
+
+/**
+ * Run context the calibration cannot discover for itself. All injected, same
+ * as `RunMetadata` — and smaller than it, deliberately: a calibration run has
+ * no generator, no k, and applies no threshold, so recording those would claim
+ * facts about a run that never used them.
+ */
+export interface CalibrationRunMetadata {
+  /** ISO 8601. A parameter, never `new Date()` here — see `buildArtifact`. */
+  readonly generatedAt: string;
+  /** The embedding model that RAN, e.g. `voyage-4` or `fake-embedder`. The
+   *  model that was PRICED is named inside `usage.pricing`; the artifact
+   *  carries both so a mismatch is visible in the file rather than silently
+   *  wrong. Names a model, never a key. */
+  readonly embedder: string;
+  readonly corpusDir: string;
+  readonly chunkCount: number;
+  readonly questionCount: number;
+}
+
+/**
+ * The calibration bill. Pure embedding — no generator runs, so there are no
+ * generation tokens to account for and no generation prices are recorded:
+ * only the embedding half of the pricing snapshot travels with the figure it
+ * actually priced.
+ */
+export interface CalibrationUsage {
+  readonly embeddingTokens: number;
+  readonly embeddingCalls: number;
+  readonly latencyMs: number;
+  /** Cost at the committed price in `src/cost.ts`, for the model IT names. */
+  readonly costUsd: number;
+  /** The price the dollar figure was computed at, with its as-of date —
+   *  same principle as `RunUsage.pricing`: a stored cost without its prices
+   *  is silently reinterpreted the day the constants move. */
+  readonly pricing: PricingSnapshot["embedding"];
+}
+
+/**
+ * What a calibration run writes to `results/`. Self-contained by design,
+ * exactly as `EvalArtifact` is: the statistics, the named boundary cases, the
+ * model, the prices, and the constant the measurement exists to inform.
+ *
+ * THE RAW SAMPLE GRID IS NOT INCLUDED. It is chunks-times-questions rows of
+ * scores — a thousand lines of JSON that would bury the dozen numbers two
+ * artifacts are compared by — and it is exactly reproducible by re-running
+ * `--calibrate` against the same embedder and corpus. The boundary cases are
+ * the rows a floor decision actually reads, and they are here by name.
+ */
+export interface CalibrationArtifact {
+  readonly schemaVersion: number;
+  readonly run: CalibrationRunMetadata;
+  readonly correct: Distribution;
+  readonly wrong: Distribution;
+  readonly separation: Separation;
+  readonly boundary: BoundaryCases;
+  /** The value of `MIN_SIMILARITY` when the run happened. Reported, not moved. */
+  readonly currentThreshold: number;
+  /**
+   * Stored beside the numbers for the same reason the gate stores its policy:
+   * so the file read alone, months later, still says what it is and is not.
+   */
+  readonly thresholdNote: string;
+  /** `null` for a run that was not instrumented; the CLI always instruments. */
+  readonly usage: CalibrationUsage | null;
+}
+
+/**
+ * Assemble the calibration artifact. The timestamp arrives inside `run` and
+ * the usage arrives as the embedder's own cumulative accounting, for the same
+ * reasons as `buildArtifact`: nothing here reads a clock, and the cost is
+ * computed from the provider's numbers at the committed price, never invented.
+ */
+export function buildCalibrationArtifact(
+  report: CalibrationReport,
+  run: CalibrationRunMetadata,
+  usage: EmbeddingUsage | null = null,
+): CalibrationArtifact {
+  return {
+    schemaVersion: CALIBRATION_ARTIFACT_SCHEMA_VERSION,
+    run,
+    correct: report.correct,
+    wrong: report.wrong,
+    separation: report.separation,
+    boundary: report.boundary,
+    currentThreshold: report.currentThreshold,
+    thresholdNote:
+      "This artifact does not change MIN_SIMILARITY. The floor is a property of the embedding model, so a number measured against anything but the live embedder is a number about the wrong thing. Moving the constant is a separate reviewed commit to src/retrieve.ts.",
+    usage:
+      usage === null
+        ? null
+        : {
+            embeddingTokens: usage.totalTokens,
+            embeddingCalls: usage.calls,
+            latencyMs: usage.totalLatencyMs,
+            costUsd: computeEmbeddingCost(usage.totalTokens),
+            pricing: PRICING.embedding,
+          },
+  };
+}
+
+/** The calibration report, persisted the way the gate's verdict is. */
+export async function writeCalibrationArtifact(
+  directory: string,
+  artifact: CalibrationArtifact,
+): Promise<readonly string[]> {
+  return writeArtifactPair(directory, "calibration", artifact.run.generatedAt, artifact);
 }
