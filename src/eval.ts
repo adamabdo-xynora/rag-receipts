@@ -50,10 +50,24 @@ import path from "node:path";
 import {
   type AnswerResult,
   type Generator,
+  type InstrumentedGenerator,
   type RefusalReason,
   answerQuestion,
 } from "./answer.js";
-import type { Embedder, SearchResult, VectorIndex } from "./retrieve.js";
+import {
+  PRICING,
+  type PricingSnapshot,
+  computeEmbeddingCost,
+  computeGenerationCost,
+  formatUsd,
+} from "./cost.js";
+import type {
+  Embedder,
+  EmbeddingUsage,
+  InstrumentedEmbedder,
+  SearchResult,
+  VectorIndex,
+} from "./retrieve.js";
 import { MIN_SIMILARITY, search } from "./retrieve.js";
 
 /* ===========================================================================
@@ -712,6 +726,143 @@ export async function runEvaluation(
 }
 
 /* ===========================================================================
+ * Usage accounting.
+ * ======================================================================== */
+
+/** Tokens, time, and dollars for one slice of the run. */
+export interface UsageTotals {
+  readonly embeddingTokens: number;
+  readonly generationInputTokens: number;
+  readonly generationOutputTokens: number;
+  readonly latencyMs: number;
+  /** Cost at the committed prices in `src/cost.ts`, for the models THEY name. */
+  readonly costUsd: number;
+}
+
+/** One question's slice: everything in `UsageTotals`, addressed by id. */
+export interface QuestionUsage extends UsageTotals {
+  readonly questionId: string;
+}
+
+/** The whole run's accounting, carried into the artifact and the report. */
+export interface RunUsage {
+  /**
+   * Usage the embedder and generator had already accumulated before the first
+   * question ran. In the CLI's flow that is exactly the corpus index build —
+   * the largest embedding spend of the run — and leaving it out of the totals
+   * would report a run cost smaller than the invoice.
+   */
+  readonly indexing: UsageTotals;
+  /** One row per question, in run order. */
+  readonly perQuestion: readonly QuestionUsage[];
+  /** `indexing` plus every per-question row. */
+  readonly totals: UsageTotals;
+  /**
+   * The prices the dollar figures were computed at, with their as-of dates.
+   * SAME PRINCIPLE AS STORING THE POLICY BESIDE THE VERDICT: the constants in
+   * `src/cost.ts` will move, and a stored cost without the prices it was
+   * computed from would be silently reinterpreted against numbers that were
+   * not in force when it was measured.
+   */
+  readonly pricing: PricingSnapshot;
+}
+
+function usageTotals(
+  embeddingTokens: number,
+  generationInputTokens: number,
+  generationOutputTokens: number,
+  latencyMs: number,
+): UsageTotals {
+  return {
+    embeddingTokens,
+    generationInputTokens,
+    generationOutputTokens,
+    latencyMs,
+    costUsd:
+      computeEmbeddingCost(embeddingTokens) +
+      computeGenerationCost(generationInputTokens, generationOutputTokens),
+  };
+}
+
+function addTotals(a: UsageTotals, b: UsageTotals): UsageTotals {
+  return usageTotals(
+    a.embeddingTokens + b.embeddingTokens,
+    a.generationInputTokens + b.generationInputTokens,
+    a.generationOutputTokens + b.generationOutputTokens,
+    a.latencyMs + b.latencyMs,
+  );
+}
+
+/** `runEvaluation`, with the providers' own accounting read alongside. */
+export interface InstrumentedEvalRunOptions extends EvalRunOptions {
+  readonly embedder: InstrumentedEmbedder;
+  readonly generator: InstrumentedGenerator;
+}
+
+/**
+ * Run every question exactly as `runEvaluation` does, and attribute usage.
+ *
+ * THE SCORING IS IDENTICAL BY CONSTRUCTION: the same `answerQuestion` call
+ * with the same options, the same `scoreQuestion`, the same order. The only
+ * addition is bookkeeping — cumulative usage is snapshotted before and after
+ * each question and the difference is that question's row, which works because
+ * the run is sequential (see `runEvaluation` for why it stays sequential).
+ * `test/usage.test.ts` asserts the two functions produce identical scores, so
+ * the two loops cannot drift apart silently.
+ *
+ * `runEvaluation` stays as the uninstrumented seam so existing callers — and
+ * any future caller that has only a bare `Embedder` — compile unchanged.
+ */
+export async function runInstrumentedEvaluation(
+  questions: readonly EvalQuestion[],
+  options: InstrumentedEvalRunOptions,
+): Promise<{ readonly scores: QuestionScore[]; readonly usage: RunUsage }> {
+  let embedBefore = options.embedder.usage();
+  let genBefore = options.generator.usage();
+
+  const indexing = usageTotals(
+    embedBefore.totalTokens,
+    genBefore.inputTokens,
+    genBefore.outputTokens,
+    embedBefore.totalLatencyMs + genBefore.totalLatencyMs,
+  );
+
+  const scores: QuestionScore[] = [];
+  const perQuestion: QuestionUsage[] = [];
+
+  for (const question of questions) {
+    const result = await answerQuestion(question.question, {
+      index: options.index,
+      embedder: options.embedder,
+      generator: options.generator,
+      ...(options.k === undefined ? {} : { k: options.k }),
+      ...(options.threshold === undefined ? {} : { threshold: options.threshold }),
+    });
+    scores.push(scoreQuestion(question, result));
+
+    const embedAfter = options.embedder.usage();
+    const genAfter = options.generator.usage();
+    perQuestion.push({
+      questionId: question.id,
+      ...usageTotals(
+        embedAfter.totalTokens - embedBefore.totalTokens,
+        genAfter.inputTokens - genBefore.inputTokens,
+        genAfter.outputTokens - genBefore.outputTokens,
+        embedAfter.totalLatencyMs -
+          embedBefore.totalLatencyMs +
+          (genAfter.totalLatencyMs - genBefore.totalLatencyMs),
+      ),
+    });
+    embedBefore = embedAfter;
+    genBefore = genAfter;
+  }
+
+  const totals = perQuestion.reduce<UsageTotals>(addTotals, indexing);
+
+  return { scores, usage: { indexing, perQuestion, totals, pricing: PRICING } };
+}
+
+/* ===========================================================================
  * The gate.
  * ======================================================================== */
 
@@ -921,8 +1072,78 @@ export function formatResultsTable(report: GateReport): string {
   return [line(header), rule, ...rows.map(line)].join("\n");
 }
 
-/** The whole printed report: headline first, then table, policy, violations. */
-export function formatGateReport(report: GateReport): string {
+/** Right-align numbers so a column of them can be compared by eye. */
+function padLeft(value: string, width: number): string {
+  return value.length >= width ? value : " ".repeat(width - value.length) + value;
+}
+
+/** One line naming both as-of dates. Printed with every cost figure. */
+function pricingAsOfLine(pricing: PricingSnapshot): string {
+  return [
+    `Prices committed in src/cost.ts:`,
+    `${pricing.embedding.model} as of ${pricing.embedding.asOf},`,
+    `${pricing.generation.model} as of ${pricing.generation.asOf}.`,
+    `Prices change and this repository does not phone home — a stale constant is a wrong dollar figure with nothing loud about it.`,
+  ].join(" ");
+}
+
+/** The cost table: one row per question, an index-build row, and totals. */
+export function formatUsageReport(usage: RunUsage): string {
+  const header = ["QUESTION", "EMBED TOK", "GEN IN", "GEN OUT", "LATENCY MS", "COST"];
+
+  const row = (label: string, totals: UsageTotals): string[] => [
+    label,
+    String(totals.embeddingTokens),
+    String(totals.generationInputTokens),
+    String(totals.generationOutputTokens),
+    String(totals.latencyMs),
+    formatUsd(totals.costUsd),
+  ];
+
+  const rows = [
+    row("(index build)", usage.indexing),
+    ...usage.perQuestion.map((question) => row(question.questionId, question)),
+    row("TOTAL", usage.totals),
+  ];
+
+  const widths = header.map((_, column) =>
+    Math.max(header[column]?.length ?? 0, ...rows.map((cells) => cells[column]?.length ?? 0)),
+  );
+
+  const line = (cells: readonly string[]): string =>
+    cells
+      .map((cell, column) =>
+        // The first column is a label and reads left; every other column is a
+        // number and right-aligns so magnitudes line up.
+        column === 0 ? padRight(cell, widths[column] ?? 0) : padLeft(cell, widths[column] ?? 0),
+      )
+      .join("  ")
+      .trimEnd();
+
+  const rule = widths.map((width) => "-".repeat(width)).join("  ");
+  const totalRow = rows[rows.length - 1] ?? [];
+
+  return [
+    `USAGE AND COST`,
+    ``,
+    line(header),
+    rule,
+    ...rows.slice(0, -1).map(line),
+    rule,
+    line(totalRow),
+    ``,
+    `  ${pricingAsOfLine(usage.pricing)}`,
+  ].join("\n");
+}
+
+/**
+ * The whole printed report: headline first, then table, policy, violations.
+ *
+ * `usage` is optional so callers without instrumentation (the demo, older
+ * tests) print exactly what they always printed, byte for byte. The CLI
+ * passes it and its report gains the cost table.
+ */
+export function formatGateReport(report: GateReport, usage?: RunUsage): string {
   const sections: string[] = [];
 
   if (report.headlineViolations.length > 0) {
@@ -968,6 +1189,10 @@ export function formatGateReport(report: GateReport): string {
     );
   }
 
+  if (usage !== undefined) {
+    sections.push(formatUsageReport(usage));
+  }
+
   sections.push(
     `VERDICT: ${report.passed ? "PASS" : "FAIL"} (${report.totalPassed}/${report.totalQuestions} questions passed)`,
   );
@@ -983,8 +1208,14 @@ export function formatGateReport(report: GateReport): string {
  * Bumped when the artifact's shape changes in a way that would mislead a reader
  * comparing two files. Old artifacts stay readable because they say which
  * schema they are.
+ *
+ * 2: the artifact gained a `usage` section — per-question tokens, latency, and
+ *    cost, plus the pricing constants (with as-of dates) the costs were
+ *    computed at. A reader comparing a schema-1 artifact with a schema-2 one
+ *    should know the absence of a cost in the older file means "not measured",
+ *    not "free".
  */
-export const ARTIFACT_SCHEMA_VERSION = 1;
+export const ARTIFACT_SCHEMA_VERSION = 2;
 
 /** Run context the eval cannot discover for itself. All of it is injected. */
 export interface RunMetadata {
@@ -1026,6 +1257,13 @@ export interface EvalArtifact {
   readonly violations: readonly Violation[];
   readonly questions: readonly QuestionScore[];
   readonly totals: { readonly questions: number; readonly passed: number };
+  /**
+   * Tokens, latency, and cost — with the pricing constants and their as-of
+   * dates copied in, for the same reason the policy is: a stored run stays
+   * interpretable after the prices in `src/cost.ts` move. `null` for a run
+   * that was not instrumented; the CLI always instruments.
+   */
+  readonly usage: RunUsage | null;
 }
 
 /**
@@ -1036,7 +1274,11 @@ export interface EvalArtifact {
  * either freeze time globally or check the field loosely, and a loosely checked
  * field is an unchecked one. Whoever runs the eval knows what time it is.
  */
-export function buildArtifact(report: GateReport, run: RunMetadata): EvalArtifact {
+export function buildArtifact(
+  report: GateReport,
+  run: RunMetadata,
+  usage: RunUsage | null = null,
+): EvalArtifact {
   return {
     schemaVersion: ARTIFACT_SCHEMA_VERSION,
     verdict: report.passed ? "PASS" : "FAIL",
@@ -1052,6 +1294,7 @@ export function buildArtifact(report: GateReport, run: RunMetadata): EvalArtifac
     violations: report.violations,
     questions: report.scores,
     totals: { questions: report.totalQuestions, passed: report.totalPassed },
+    usage,
   };
 }
 
@@ -1300,10 +1543,36 @@ function stat(value: number): string {
   return Number.isNaN(value) ? "   n/a" : value.toFixed(4);
 }
 
-/** A human-readable calibration report. Printed by the CLI, asserted in tests. */
-export function formatCalibrationReport(report: CalibrationReport): string {
+/**
+ * A human-readable calibration report. Printed by the CLI, asserted in tests.
+ *
+ * `usage` is optional for the same reason as in `formatGateReport`: without
+ * it the output is unchanged byte for byte. The CLI passes the embedder's
+ * cumulative usage — a calibration run is pure embedding, so tokens, time,
+ * and dollars here are the whole bill.
+ */
+export function formatCalibrationReport(
+  report: CalibrationReport,
+  usage?: EmbeddingUsage,
+): string {
   const row = (label: string, distribution: Distribution): string =>
     `  ${padRight(label, 26)} n=${padRight(String(distribution.count), 6)} min ${stat(distribution.min)}  p05 ${stat(distribution.p05)}  median ${stat(distribution.median)}  p95 ${stat(distribution.p95)}  max ${stat(distribution.max)}  mean ${stat(distribution.mean)}`;
+
+  const usageSection =
+    usage === undefined
+      ? []
+      : [
+          ``,
+          `  EMBEDDING USAGE AND COST`,
+          `  embedding tokens            ${usage.totalTokens}`,
+          `  embedding calls             ${usage.calls}`,
+          `  latency (ms, wall clock)    ${usage.totalLatencyMs}`,
+          `  cost                        ${formatUsd(computeEmbeddingCost(usage.totalTokens))}`,
+          ``,
+          `  ${PRICING.embedding.model} priced as of ${PRICING.embedding.asOf}, committed in src/cost.ts. Prices change`,
+          `  and this repository does not phone home — a stale constant is a wrong dollar figure`,
+          `  with nothing loud about it.`,
+        ];
 
   return [
     `SIMILARITY CALIBRATION`,
@@ -1321,5 +1590,6 @@ export function formatCalibrationReport(report: CalibrationReport): string {
     `  This report does not change MIN_SIMILARITY. The floor is a property of the embedding`,
     `  model, so a number measured against anything but the live embedder is a number about`,
     `  the wrong thing. Moving it is a reviewed commit to src/retrieve.ts.`,
+    ...usageSection,
   ].join("\n");
 }

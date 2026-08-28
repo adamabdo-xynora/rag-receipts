@@ -62,6 +62,35 @@ export interface Generator {
   generate(system: string, user: string): Promise<string>;
 }
 
+/**
+ * Cumulative usage across every completed generation call.
+ *
+ * CUMULATIVE, NOT PER-CALL, for the same reason as `EmbeddingUsage` in
+ * `retrieve.ts`: a caller attributing usage to one unit of work snapshots
+ * before and after and takes the difference, and the generator never has to
+ * know what the unit is.
+ */
+export interface GenerationUsage {
+  /** Sum of the provider-reported `usage.input_tokens` over completed calls. */
+  readonly inputTokens: number;
+  /** Sum of the provider-reported `usage.output_tokens` over completed calls. */
+  readonly outputTokens: number;
+  readonly calls: number;
+  /** Wall-clock milliseconds across those calls, via the injected clock. */
+  readonly totalLatencyMs: number;
+}
+
+/**
+ * A generator that also reports what its calls cost in tokens and time.
+ *
+ * A SEPARATE INTERFACE rather than a change to `Generator`, so the seam stays
+ * two strings in, one string out and every fake in every test keeps compiling.
+ * Code that wants the accounting asks for this type explicitly.
+ */
+export interface InstrumentedGenerator extends Generator {
+  usage(): GenerationUsage;
+}
+
 /** Every way generation can fail. Each one is covered by a test. */
 export type GenerationErrorKind =
   /** The provider rejected the request, or the transport did. */
@@ -123,6 +152,11 @@ export interface AnthropicGeneratorConfig {
   readonly model: string;
   /** Used as-is when present; otherwise a client is built from `apiKey`. */
   readonly client?: Anthropic;
+  /**
+   * Millisecond clock for latency measurement. Defaults to `Date.now`.
+   * Injected so a test can assert an exact latency instead of a range.
+   */
+  readonly clock?: () => number;
 }
 
 /**
@@ -141,12 +175,34 @@ const MAX_TOKENS = 16_000;
  * Sampling parameters are not passed: they are removed on the current models,
  * and this call wants the model's own best JSON rather than a temperature
  * setting someone tuned once and never revisited.
+ *
+ * USAGE IS COUNTED THE MOMENT A RESPONSE ARRIVES, before the stop-reason
+ * checks below. A refusal or a truncation is still a billed response — the
+ * provider metered it and will charge for it — so counting only the calls
+ * this module went on to accept would report a cost smaller than the invoice.
+ * (Every caller aborts the run when those checks throw, so in practice the
+ * distinction is unobservable today; the ordering is chosen for the day it
+ * is not.) The token fields are read tolerantly, like the embedder's: a
+ * response without them is still an answer, and instrumentation must not
+ * break the thing it instruments.
  */
-export function anthropicGenerator(config: AnthropicGeneratorConfig): Generator {
+export function anthropicGenerator(config: AnthropicGeneratorConfig): InstrumentedGenerator {
   const client = config.client ?? new Anthropic({ apiKey: config.apiKey });
+  const clock = config.clock ?? Date.now;
+
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let calls = 0;
+  let totalLatencyMs = 0;
 
   return {
+    usage(): GenerationUsage {
+      return { inputTokens, outputTokens, calls, totalLatencyMs };
+    },
+
     async generate(system: string, user: string): Promise<string> {
+      const startedAt = clock();
+
       let response: Anthropic.Message;
       try {
         response = await client.messages.create({
@@ -166,6 +222,15 @@ export function anthropicGenerator(config: AnthropicGeneratorConfig): Generator 
           status,
         );
       }
+
+      // The response arrived: count it, whatever the stop-reason checks below
+      // decide about it. See the usage note in this function's header comment.
+      const reportedIn: unknown = response.usage.input_tokens;
+      const reportedOut: unknown = response.usage.output_tokens;
+      if (typeof reportedIn === "number" && Number.isFinite(reportedIn)) inputTokens += reportedIn;
+      if (typeof reportedOut === "number" && Number.isFinite(reportedOut)) outputTokens += reportedOut;
+      calls += 1;
+      totalLatencyMs += clock() - startedAt;
 
       // Checked before the content is read. A refusal or a truncation still
       // returns content blocks, and reading them without checking turns a

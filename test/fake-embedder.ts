@@ -21,7 +21,7 @@
  * vocabulary do not belong here.
  */
 
-import type { Embedder, EmbeddingKind } from "../src/retrieve.js";
+import type { EmbeddingKind, EmbeddingUsage, InstrumentedEmbedder } from "../src/retrieve.js";
 
 /** Small enough to stay cheap, large enough that collisions stay rare. */
 export const FAKE_DIMENSIONS = 512;
@@ -32,7 +32,7 @@ export interface FakeEmbedderCall {
   readonly kind: EmbeddingKind;
 }
 
-export interface FakeEmbedder extends Embedder {
+export interface FakeEmbedder extends InstrumentedEmbedder {
   /** Every call in order. The whole point of the document/query split is that
    *  the hint reaches the provider, so tests need to be able to see it. */
   readonly calls: readonly FakeEmbedderCall[];
@@ -92,6 +92,15 @@ export function createFakeEmbedder(): FakeEmbedder {
   const calls: FakeEmbedderCall[] = [];
   return {
     calls,
+    // Zero usage, in the live embedder's shape, ALWAYS. No provider was
+    // called, no tokens were billed, and no time was spent on a network —
+    // reporting invented nonzero numbers here would be a fake measuring
+    // itself. Zeros keep everything downstream (per-question deltas, cost
+    // arithmetic, report tables) running offline without pretending a cost
+    // was incurred.
+    usage(): EmbeddingUsage {
+      return { totalTokens: 0, calls: 0, totalLatencyMs: 0 };
+    },
     async embed(texts: string[], kind: EmbeddingKind): Promise<number[][]> {
       calls.push({ texts: [...texts], kind });
       return texts.map(fakeVector);

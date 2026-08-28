@@ -62,7 +62,7 @@ import {
   formatCalibrationReport,
   formatGateReport,
   loadQuestionSet,
-  runEvaluation,
+  runInstrumentedEvaluation,
   writeArtifact,
 } from "./eval.js";
 import { MIN_SIMILARITY, buildIndex, voyageEmbedder } from "./retrieve.js";
@@ -275,7 +275,7 @@ export function resolveKeys(
  * visible next to the environment variable that overrides it and next to the
  * artifact field that records which one actually ran.
  */
-export const DEFAULT_EMBEDDING_MODEL = "voyage-3";
+export const DEFAULT_EMBEDDING_MODEL = "voyage-4";
 export const DEFAULT_GENERATION_MODEL = "claude-opus-5";
 
 /** Read a model override, or fall back. Never throws; never reads a key. */
@@ -484,7 +484,9 @@ export async function main(options: MainOptions): Promise<number> {
   if (args.calibrate) {
     try {
       const report = await calibrateThreshold(questions, index, embedder);
-      out.log(formatCalibrationReport(report));
+      // The cumulative usage at this point is the whole calibration bill:
+      // the index build plus one query embedding per question, nothing else.
+      out.log(formatCalibrationReport(report, embedder.usage()));
       return EXIT_PASS;
     } catch (error) {
       out.error(`Calibration could not complete: ${describeError(error)}`);
@@ -503,9 +505,12 @@ export async function main(options: MainOptions): Promise<number> {
   const generator = anthropicGenerator({ apiKey: anthropicKey, model: generationModel });
 
   let report;
+  let usage;
   try {
     out.log(`Running ${questions.length} questions against ${generationModel}...`);
-    report = applyGate(await runEvaluation(questions, { index, embedder, generator }));
+    const run = await runInstrumentedEvaluation(questions, { index, embedder, generator });
+    report = applyGate(run.scores);
+    usage = run.usage;
   } catch (error) {
     // An outage is not a verdict. Nothing is written and the exit code says
     // "setup", not "fail" — see the exit-code note at the top of this file.
@@ -515,7 +520,7 @@ export async function main(options: MainOptions): Promise<number> {
   }
 
   out.log("");
-  out.log(formatGateReport(report));
+  out.log(formatGateReport(report, usage));
 
   const metadata: RunMetadata = {
     generatedAt: now,
@@ -528,7 +533,7 @@ export async function main(options: MainOptions): Promise<number> {
   };
 
   try {
-    const written = await writeArtifact(paths.resultsDir, buildArtifact(report, metadata));
+    const written = await writeArtifact(paths.resultsDir, buildArtifact(report, metadata, usage));
     out.log("");
     for (const file of written) out.log(`artifact: ${file}`);
   } catch (error) {

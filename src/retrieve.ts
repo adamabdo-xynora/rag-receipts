@@ -63,6 +63,35 @@ export interface Embedder {
   embed(texts: string[], kind: EmbeddingKind): Promise<number[][]>;
 }
 
+/**
+ * Cumulative usage across every completed call an embedder has made.
+ *
+ * CUMULATIVE, NOT PER-CALL, on purpose: a caller that wants to attribute usage
+ * to one unit of work (one eval question, say) snapshots before and after and
+ * takes the difference, which composes without the embedder having to know
+ * what a "question" is.
+ */
+export interface EmbeddingUsage {
+  /** Sum of the provider-reported `total_tokens` over every completed call. */
+  readonly totalTokens: number;
+  /** Completed calls — batches, in `buildIndex` terms. */
+  readonly calls: number;
+  /** Wall-clock milliseconds across those calls, via the injected clock. */
+  readonly totalLatencyMs: number;
+}
+
+/**
+ * An embedder that also reports what its calls cost in tokens and time.
+ *
+ * A SEPARATE INTERFACE rather than a change to `Embedder`, so that every
+ * existing implementation and every test fake keeps compiling unchanged —
+ * `search` and `buildIndex` need vectors, not accounting, and their signatures
+ * say so. Code that wants the accounting asks for this type explicitly.
+ */
+export interface InstrumentedEmbedder extends Embedder {
+  usage(): EmbeddingUsage;
+}
+
 /** Every way embedding can fail. Each one is covered by a test. */
 export type EmbeddingErrorKind =
   /** The provider answered with a non-2xx status. */
@@ -137,6 +166,12 @@ export interface VoyageConfig {
   readonly model: string;
   /** Defaults to `globalThis.fetch`. */
   readonly fetchImpl?: typeof globalThis.fetch;
+  /**
+   * Millisecond clock for latency measurement. Defaults to `Date.now`.
+   * Injected so a test can assert an exact latency instead of a range —
+   * a latency assertion with slack in it is an assertion that never fails.
+   */
+  readonly clock?: () => number;
 }
 
 /** One entry of the endpoint's `data` array, once validated. */
@@ -176,16 +211,33 @@ function readDatum(entry: unknown): VoyageDatum | null {
  * `EmbeddingError` naming the status. That is loud, which is the requirement.
  * Chunking large corpora into batches belongs to whoever knows the limits of
  * the model they picked.
+ *
+ * USAGE IS COUNTED ONLY FOR COMPLETED CALLS. A call that throws contributes
+ * nothing to the counters: every caller of this embedder aborts the run on an
+ * `EmbeddingError`, so a partially-counted failed call would be a number
+ * nobody ever reads — and a number that WAS read would misattribute a failed
+ * request's time to whatever question happened to be running.
  */
-export function voyageEmbedder(config: VoyageConfig): Embedder {
+export function voyageEmbedder(config: VoyageConfig): InstrumentedEmbedder {
   const doFetch = config.fetchImpl ?? globalThis.fetch;
+  const clock = config.clock ?? Date.now;
+
+  let totalTokens = 0;
+  let calls = 0;
+  let totalLatencyMs = 0;
 
   return {
+    usage(): EmbeddingUsage {
+      return { totalTokens, calls, totalLatencyMs };
+    },
+
     async embed(texts: string[], kind: EmbeddingKind): Promise<number[][]> {
       // Nothing to embed is not an error, and it is not a request either:
       // the endpoint rejects an empty input array, so asking would turn a
-      // no-op into a 400.
+      // no-op into a 400. No request, so no usage is counted.
       if (texts.length === 0) return [];
+
+      const startedAt = clock();
 
       let response: Response;
       try {
@@ -274,6 +326,21 @@ export function voyageEmbedder(config: VoyageConfig): Embedder {
         }
         ordered.push(vector);
       }
+
+      // The call completed; count it. `usage.total_tokens` is read tolerantly:
+      // a response that omits it (or mangles it) is still a valid batch of
+      // vectors, and failing the whole run over a missing accounting field
+      // would let instrumentation break the thing it instruments. The cost of
+      // the tolerance is an undercount, which at least errs toward a smaller
+      // number rather than an invented one.
+      const usage = body["usage"];
+      const reported = isRecord(usage) ? usage["total_tokens"] : undefined;
+      if (typeof reported === "number" && Number.isFinite(reported)) {
+        totalTokens += reported;
+      }
+      calls += 1;
+      totalLatencyMs += clock() - startedAt;
+
       return ordered;
     },
   };
