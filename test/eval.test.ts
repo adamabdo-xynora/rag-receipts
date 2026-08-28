@@ -24,6 +24,7 @@ import {
   type CalibrationRunMetadata,
   type CalibrationSample,
   type EvalQuestion,
+  type Outcome,
   type QuestionScore,
   type RunMetadata,
   ARTIFACT_SCHEMA_VERSION,
@@ -48,6 +49,7 @@ import {
   runEvaluation,
   scoreQuestion,
   selectBoundaryCases,
+  selectMustRefuseCeiling,
   writeArtifact,
   writeCalibrationArtifact,
 } from "../src/eval.js";
@@ -1093,6 +1095,87 @@ describe("calibration", () => {
     const scoreAt = must(line, "the printed boundary row").indexOf(worst.score.toFixed(4));
     expect(scoreAt).toBeLessThan(must(line, "the printed boundary row").indexOf(worst.questionId));
   });
+
+  it("names each must-refuse question's best chunk and the ceiling the floor must exceed", async () => {
+    const plan = idealPlan(questions);
+    const embedder = createOracleEmbedder(chunks, questions, plan);
+    const index = await buildIndex(chunks, embedder);
+
+    const report = await calibrateThreshold(questions, index, embedder);
+    const mustRefuseQuestions = questions.filter(
+      (question) => question.outcome === "refused-no-documents",
+    );
+
+    // One row per must-refuse question, every row on the wrong side — a
+    // no-answer question has no correct chunk, by construction.
+    expect(mustRefuseQuestions.length).toBeGreaterThan(0);
+    expect(new Set(report.mustRefuse.rows.map((row) => row.questionId))).toEqual(
+      new Set(mustRefuseQuestions.map((question) => question.id)),
+    );
+    expect(report.mustRefuse.rows).toHaveLength(mustRefuseQuestions.length);
+    expect(
+      report.mustRefuse.rows.every(
+        (row) => row.outcome === "refused-no-documents" && !row.correct,
+      ),
+    ).toBe(true);
+
+    // The ceiling is the maximum across the rows, the separation carries it,
+    // and — must-refuse wrongs being a subset of all wrongs — it can never
+    // exceed the pooled best wrong score.
+    const ceiling = must(report.mustRefuse.highest, "the must-refuse ceiling");
+    expect(ceiling).toBe(Math.max(...report.mustRefuse.rows.map((row) => row.score)));
+    expect(report.separation.highestMustRefuseWrong).toBe(ceiling);
+    expect(ceiling).toBeLessThanOrEqual(
+      must(report.separation.highestWrong, "the best wrong score"),
+    );
+
+    // The oracle separates by construction, so the soundness gap is clean and
+    // the suggested floor sits strictly inside it: above the ceiling, below
+    // the worst correct retrieval.
+    expect(report.separation.mustRefuseSeparable).toBe(true);
+    const suggested = must(
+      report.separation.suggestedMustRefuseFloor,
+      "a suggested soundness floor",
+    );
+    expect(suggested).toBeGreaterThan(ceiling);
+    expect(suggested).toBeLessThan(
+      must(report.separation.lowestCorrect, "the worst correct score"),
+    );
+  });
+
+  it("prints the must-refuse section and a verdict that separates soundness from precision", async () => {
+    const plan = idealPlan(questions);
+    const embedder = createOracleEmbedder(chunks, questions, plan);
+    const index = await buildIndex(chunks, embedder);
+
+    const report = await calibrateThreshold(questions, index, embedder);
+    const printed = formatCalibrationReport(report);
+
+    expect(printed).toContain("BEST-SCORING CHUNK PER MUST-REFUSE QUESTION");
+    expect(printed).toContain("must-refuse ceiling");
+    expect(printed).toContain("the number the floor must exceed");
+    expect(printed).toContain("best must-refuse chunk");
+    expect(printed).toContain("suggested soundness floor");
+
+    // Every must-refuse question is named in the report, with its best chunk
+    // and the score to four places on the same line.
+    for (const row of report.mustRefuse.rows) {
+      const line = printed
+        .split("\n")
+        .find(
+          (candidate) => candidate.includes(row.questionId) && candidate.includes(row.chunkId),
+        );
+      expect(must(line, `the printed must-refuse row for ${row.questionId}`)).toContain(
+        row.score.toFixed(4),
+      );
+    }
+
+    // The verdict reports both splits and says which failure each bears on:
+    // the must-refuse separation is the soundness constraint, the naive one
+    // the precision cost.
+    expect(report.separation.verdict).toContain("must-refuse split");
+    expect(report.separation.verdict).toContain("soundness");
+  });
 });
 
 /* ===========================================================================
@@ -1189,6 +1272,60 @@ describe("selectBoundaryCases", () => {
 });
 
 /* ===========================================================================
+ * Must-refuse ceiling selection, directly.
+ * ======================================================================== */
+
+describe("selectMustRefuseCeiling", () => {
+  function sample(
+    questionId: string,
+    chunkId: string,
+    score: number,
+    outcome: Outcome,
+  ): CalibrationSample {
+    return { questionId, outcome, chunkId, score, correct: false };
+  }
+
+  it("keeps one best chunk per must-refuse question and ignores other questions' wrong chunks", () => {
+    const ceiling = selectMustRefuseCeiling([
+      sample("q-refuse-a", "doc#low", 0.2, "refused-no-documents"),
+      sample("q-refuse-a", "doc#high", 0.45, "refused-no-documents"),
+      sample("q-refuse-b", "doc#mid", 0.3, "refused-no-documents"),
+      // The best wrong chunks overall belong to answerable questions. They
+      // cost precision, not soundness, and must not set the ceiling.
+      sample("q-answered", "doc#huge", 0.9, "answered"),
+      sample("q-contradiction", "doc#big", 0.8, "refused-contradiction"),
+    ]);
+
+    expect(ceiling.rows.map((row) => `${row.questionId} ${row.chunkId}`)).toEqual([
+      "q-refuse-a doc#high",
+      "q-refuse-b doc#mid",
+    ]);
+    expect(ceiling.highest).toBe(0.45);
+  });
+
+  it("breaks score ties by question id then chunk id, so two runs name the same rows", () => {
+    const ceiling = selectMustRefuseCeiling([
+      sample("q-a", "doc#z", 0.5, "refused-no-documents"),
+      sample("q-a", "doc#a", 0.5, "refused-no-documents"),
+      sample("q-b", "doc#b", 0.5, "refused-no-documents"),
+    ]);
+
+    expect(ceiling.rows.map((row) => `${row.questionId} ${row.chunkId}`)).toEqual([
+      "q-a doc#a",
+      "q-b doc#b",
+    ]);
+  });
+
+  it("reports no ceiling when the battery has no must-refuse questions", () => {
+    const ceiling = selectMustRefuseCeiling([
+      sample("q-answered", "doc#one", 0.9, "answered"),
+    ]);
+    expect(ceiling.rows).toEqual([]);
+    expect(ceiling.highest).toBeNull();
+  });
+});
+
+/* ===========================================================================
  * The calibration artifact.
  * ======================================================================== */
 
@@ -1219,6 +1356,7 @@ describe("the calibration artifact", () => {
     expect(artifact.wrong).toEqual(report.wrong);
     expect(artifact.separation).toEqual(report.separation);
     expect(artifact.boundary).toEqual(report.boundary);
+    expect(artifact.mustRefuse).toEqual(report.mustRefuse);
 
     // The constant is recorded, not moved, and the file says so on its own.
     expect(artifact.currentThreshold).toBe(MIN_SIMILARITY);

@@ -1381,16 +1381,39 @@ export interface Distribution {
   readonly p95: number;
 }
 
-/** Whether a floor exists, and where it would go. */
+/**
+ * Whether a floor exists, and where it would go.
+ *
+ * TWO SPLITS, BECAUSE TWO FAILURES. The naive split pools every wrong
+ * retrieval, but a wrong chunk retrieved for an answerable question and one
+ * retrieved for a must-refuse question fail differently. The first is largely
+ * absorbed downstream — the gate allows extra citations and the verifier still
+ * demands the expected chunks and exact quotes — so the naive numbers bear on
+ * precision. The second is the only route to a headline failure, because it is
+ * what puts material in front of the generator for a question the corpus
+ * cannot answer — so the must-refuse numbers bear on soundness. The floor's
+ * real constraint is: above `highestMustRefuseWrong`, below `lowestCorrect`.
+ */
 export interface Separation {
   /** The worst score among chunks that SHOULD be retrieved. The ceiling on the floor. */
   readonly lowestCorrect: number | null;
   /** The best score among chunks that should NOT be. The floor on the floor. */
   readonly highestWrong: number | null;
+  /** The best score any chunk earns for a MUST-REFUSE question — the number
+   *  the floor must exceed for the refusal path to hold. A subset of the
+   *  wrong side, so never above `highestWrong`. Null when the battery has no
+   *  must-refuse questions. */
+  readonly highestMustRefuseWrong: number | null;
   /** True when every correct chunk outscores every wrong one. */
   readonly separable: boolean;
-  /** Midpoint of the gap when separable, else null. NOT applied anywhere. */
+  /** True when every correct chunk outscores every must-refuse chunk — the
+   *  separation that bears on soundness. Implied by `separable`. */
+  readonly mustRefuseSeparable: boolean;
+  /** Midpoint of the naive gap when separable, else null. NOT applied anywhere. */
   readonly suggestedFloor: number | null;
+  /** Midpoint of the must-refuse gap when that split is clean, else null.
+   *  NOT applied anywhere. */
+  readonly suggestedMustRefuseFloor: number | null;
   /** One sentence a human can act on. */
   readonly verdict: string;
 }
@@ -1458,6 +1481,59 @@ export function selectBoundaryCases(
   };
 }
 
+/**
+ * The best-scoring chunk for each must-refuse question, and the maximum
+ * across them.
+ *
+ * These rows are pulled out of the pooled wrong side because they are a
+ * different failure. A wrong chunk retrieved for an answerable question is
+ * largely absorbed downstream — the gate allows extra citations, the verifier
+ * still demands the expected chunks and exact quotes. A chunk retrieved for a
+ * must-refuse question is the only route to a headline failure: it is what
+ * puts material in front of the generator for a question the corpus cannot
+ * answer. `highest` is therefore the number the floor must exceed.
+ */
+export interface MustRefuseCeiling {
+  /** One row per must-refuse question — its best-scoring chunk — best first. */
+  readonly rows: readonly CalibrationSample[];
+  /** The maximum across the rows: the number the floor must exceed. Null
+   *  when the battery has no must-refuse questions. */
+  readonly highest: number | null;
+}
+
+/**
+ * Pick each must-refuse question's best-scoring chunk out of the sample grid.
+ *
+ * Ties — within a question and between questions — break by question id then
+ * chunk id in codepoint order, for the same reason `selectBoundaryCases`
+ * breaks them: a report that names different chunks on different runs of the
+ * same data cannot be diffed.
+ */
+export function selectMustRefuseCeiling(
+  samples: readonly CalibrationSample[],
+): MustRefuseCeiling {
+  const bestByQuestion = new Map<string, CalibrationSample>();
+  for (const sample of samples) {
+    if (sample.outcome !== "refused-no-documents") continue;
+    const best = bestByQuestion.get(sample.questionId);
+    if (
+      best === undefined ||
+      sample.score > best.score ||
+      (sample.score === best.score && compareSampleIds(sample, best) < 0)
+    ) {
+      bestByQuestion.set(sample.questionId, sample);
+    }
+  }
+
+  const rows = [...bestByQuestion.values()].sort((a, b) =>
+    a.score !== b.score ? b.score - a.score : compareSampleIds(a, b),
+  );
+  return {
+    rows,
+    highest: rows.length === 0 ? null : (rows[0]?.score ?? null),
+  };
+}
+
 /** The whole calibration run. */
 export interface CalibrationReport {
   readonly samples: readonly CalibrationSample[];
@@ -1466,6 +1542,8 @@ export interface CalibrationReport {
   readonly separation: Separation;
   /** The named chunks at the overlap boundary. See `BoundaryCases`. */
   readonly boundary: BoundaryCases;
+  /** Each must-refuse question's best chunk, and the ceiling they set. */
+  readonly mustRefuse: MustRefuseCeiling;
   /** The constant this report exists to inform. Reported, never modified. */
   readonly currentThreshold: number;
 }
@@ -1566,18 +1644,37 @@ export async function calibrateThreshold(
   const lowestCorrect = correctScores.length === 0 ? null : Math.min(...correctScores);
   const highestWrong = wrongScores.length === 0 ? null : Math.max(...wrongScores);
 
+  const mustRefuse = selectMustRefuseCeiling(samples);
+  const highestMustRefuseWrong = mustRefuse.highest;
+
   const separable =
     lowestCorrect !== null && highestWrong !== null && lowestCorrect > highestWrong;
+  const mustRefuseSeparable =
+    lowestCorrect !== null &&
+    highestMustRefuseWrong !== null &&
+    lowestCorrect > highestMustRefuseWrong;
 
   const separation: Separation = {
     lowestCorrect,
     highestWrong,
+    highestMustRefuseWrong,
     separable,
+    mustRefuseSeparable,
     suggestedFloor:
       separable && lowestCorrect !== null && highestWrong !== null
         ? (lowestCorrect + highestWrong) / 2
         : null,
-    verdict: describeSeparation(lowestCorrect, highestWrong, separable),
+    suggestedMustRefuseFloor:
+      mustRefuseSeparable && lowestCorrect !== null && highestMustRefuseWrong !== null
+        ? (lowestCorrect + highestMustRefuseWrong) / 2
+        : null,
+    verdict: describeSeparation(
+      lowestCorrect,
+      highestWrong,
+      highestMustRefuseWrong,
+      separable,
+      mustRefuseSeparable,
+    ),
   };
 
   return {
@@ -1586,33 +1683,70 @@ export async function calibrateThreshold(
     wrong: describeDistribution(wrongScores),
     separation,
     boundary: selectBoundaryCases(samples),
+    mustRefuse,
     currentThreshold: MIN_SIMILARITY,
   };
 }
 
+/**
+ * The verdict names two separations because they answer different questions.
+ * The NAIVE separation (worst correct vs best wrong overall) bears on
+ * precision: a wrong chunk admitted for an answerable question is largely
+ * absorbed downstream, because the gate allows extra citations and the
+ * verifier still demands the expected chunks and exact quotes. The
+ * MUST-REFUSE separation (worst correct vs best must-refuse wrong) bears on
+ * soundness: a must-refuse chunk over the floor is the only route to a
+ * headline failure, because it is what puts material in front of the
+ * generator for a question the corpus cannot answer.
+ */
 function describeSeparation(
   lowestCorrect: number | null,
   highestWrong: number | null,
+  highestMustRefuseWrong: number | null,
   separable: boolean,
+  mustRefuseSeparable: boolean,
 ): string {
   if (lowestCorrect === null || highestWrong === null) {
     return "not enough samples on both sides to say anything about a floor.";
   }
-  if (separable) {
+
+  const naive = separable
+    ? [
+        `the naive split separates: every chunk that should be retrieved scores above every chunk that should not`,
+        `(worst correct ${lowestCorrect.toFixed(4)} > best wrong ${highestWrong.toFixed(4)}), so any floor strictly`,
+        `between them retrieves everything required and nothing spurious.`,
+      ]
+    : [
+        `the naive split OVERLAPS: the worst correct chunk scores ${lowestCorrect.toFixed(4)} and the best wrong chunk`,
+        `scores ${highestWrong.toFixed(4)}. That overlap costs precision, and precision failures are largely absorbed`,
+        `downstream — the gate allows extra citations and the verifier still demands the expected chunks and exact`,
+        `quotes.`,
+      ];
+
+  if (highestMustRefuseWrong === null) {
     return [
-      `the distributions separate: every chunk that should be retrieved scores above every chunk that should not`,
-      `(worst correct ${lowestCorrect.toFixed(4)} > best wrong ${highestWrong.toFixed(4)}).`,
-      `Any floor strictly between them retrieves everything required and nothing spurious.`,
+      ...naive,
+      `The battery has no must-refuse questions, so this run cannot measure the separation that bears on`,
+      `soundness — the ceiling the floor must exceed is unmeasured.`,
     ].join(" ");
   }
-  return [
-    `the distributions OVERLAP: the worst correct chunk scores ${lowestCorrect.toFixed(4)} and the best wrong chunk`,
-    `scores ${highestWrong.toFixed(4)}, so no single floor both admits every required chunk and excludes every`,
-    `spurious one. A floor above ${highestWrong.toFixed(4)} refuses answerable questions; a floor below it lets`,
-    `unanswerable ones through to the generator. The second failure is the one this project exists to prevent,`,
-    `so the floor belongs at the high end of the overlap and the residual over-refusals are a retrieval problem,`,
-    `not a threshold one.`,
-  ].join(" ");
+
+  const mustRefuse = mustRefuseSeparable
+    ? [
+        `The must-refuse split — the one that bears on soundness — is clean: the worst correct chunk at`,
+        `${lowestCorrect.toFixed(4)} outscores the best chunk any must-refuse question earns, ${highestMustRefuseWrong.toFixed(4)}.`,
+        `A floor strictly between those two keeps every required chunk and starves the generator on every question`,
+        `the corpus cannot answer${separable ? "" : "; the residual naive overlap is a precision cost, not a soundness one"}.`,
+      ]
+    : [
+        `The must-refuse split — the one that bears on soundness — is NOT clean: the best chunk a must-refuse`,
+        `question earns scores ${highestMustRefuseWrong.toFixed(4)}, at or above the worst correct chunk at`,
+        `${lowestCorrect.toFixed(4)}. No floor can both admit every required chunk and keep every unanswerable`,
+        `question away from the generator. The floor belongs above ${highestMustRefuseWrong.toFixed(4)} — the`,
+        `over-refusals that buys are a retrieval problem, not a threshold one.`,
+      ];
+
+  return [...naive, ...mustRefuse].join(" ");
 }
 
 function stat(value: number): string {
@@ -1674,7 +1808,9 @@ export function formatCalibrationReport(
     `  current MIN_SIMILARITY      ${stat(report.currentThreshold)}   (unchanged by this report)`,
     `  worst correct chunk         ${report.separation.lowestCorrect === null ? "   n/a" : stat(report.separation.lowestCorrect)}`,
     `  best wrong chunk            ${report.separation.highestWrong === null ? "   n/a" : stat(report.separation.highestWrong)}`,
+    `  best must-refuse chunk      ${report.separation.highestMustRefuseWrong === null ? "   n/a" : stat(report.separation.highestMustRefuseWrong)}`,
     `  suggested floor             ${report.separation.suggestedFloor === null ? "   n/a" : stat(report.separation.suggestedFloor)}`,
+    `  suggested soundness floor   ${report.separation.suggestedMustRefuseFloor === null ? "   n/a" : stat(report.separation.suggestedMustRefuseFloor)}`,
     ``,
     `  ${report.separation.verdict}`,
     ``,
@@ -1683,6 +1819,10 @@ export function formatCalibrationReport(
     ``,
     `  HIGHEST-SCORING WRONG RETRIEVALS (top ${report.boundary.highestWrong.length} of ${report.wrong.count}) — what a lower floor starts admitting`,
     ...formatBoundaryList(report.boundary.highestWrong),
+    ``,
+    `  BEST-SCORING CHUNK PER MUST-REFUSE QUESTION — the only route to a headline failure`,
+    ...formatBoundaryList(report.mustRefuse.rows),
+    `  must-refuse ceiling         ${report.mustRefuse.highest === null ? "   n/a" : stat(report.mustRefuse.highest)}   (the number the floor must exceed)`,
     ``,
     `  This report does not change MIN_SIMILARITY. The floor is a property of the embedding`,
     `  model, so a number measured against anything but the live embedder is a number about`,
@@ -1701,8 +1841,13 @@ export function formatCalibrationReport(
  * artifact records a verdict against a policy, this one records a measurement
  * against a constant. Bumped when the shape changes in a way that would
  * mislead a reader comparing two calibration files.
+ *
+ * v2: `separation` splits into the naive and must-refuse views, and the
+ * artifact carries `mustRefuse` — each must-refuse question's best chunk and
+ * the ceiling they set. A v1 file's `separation` pooled all wrong retrievals,
+ * so its `highestWrong` is not comparable to a v2 must-refuse ceiling.
  */
-export const CALIBRATION_ARTIFACT_SCHEMA_VERSION = 1;
+export const CALIBRATION_ARTIFACT_SCHEMA_VERSION = 2;
 
 /**
  * Run context the calibration cannot discover for itself. All injected, same
@@ -1759,6 +1904,10 @@ export interface CalibrationArtifact {
   readonly wrong: Distribution;
   readonly separation: Separation;
   readonly boundary: BoundaryCases;
+  /** Each must-refuse question's best chunk, and the ceiling the floor must
+   *  exceed. See `MustRefuseCeiling` for why these rows travel separately
+   *  from the pooled wrong side. */
+  readonly mustRefuse: MustRefuseCeiling;
   /** The value of `MIN_SIMILARITY` when the run happened. Reported, not moved. */
   readonly currentThreshold: number;
   /**
@@ -1788,6 +1937,7 @@ export function buildCalibrationArtifact(
     wrong: report.wrong,
     separation: report.separation,
     boundary: report.boundary,
+    mustRefuse: report.mustRefuse,
     currentThreshold: report.currentThreshold,
     thresholdNote:
       "This artifact does not change MIN_SIMILARITY. The floor is a property of the embedding model, so a number measured against anything but the live embedder is a number about the wrong thing. Moving the constant is a separate reviewed commit to src/retrieve.ts.",
