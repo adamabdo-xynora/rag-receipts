@@ -1,0 +1,59 @@
+name: publish-image
+# Tag-triggered publish. The gate below is the reason this file is not just a
+# build-push: this repo's `test` stage ends at CMD, not RUN, so
+# `docker build --target test .` exits 0 having executed nothing. Tests only
+# run on `docker run`. Each run is its own step, so a nonzero exit fails the
+# job directly — no pipes, no `|| true`, nothing to swallow a failure.
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: read
+  packages: write
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+
+      # --load is required: under buildx the built image otherwise stays in the
+      # builder cache and is not visible to `docker run`.
+      - name: Build the test stage
+        run: docker build --target test --load -t ci-test .
+
+      - name: Run the test suite inside the image
+        run: docker run --rm ci-test npm test
+
+      - name: Typecheck inside the image
+        run: docker run --rm ci-test npm run typecheck
+
+      # The demo asserts every pipeline step inline and exits nonzero on any
+      # miss, so it is a smoke test of ingest/retrieve/verify/refuse/gate.
+      # Offline by construction — no key.
+      - name: Run the offline demo inside the image
+        run: docker run --rm ci-test npm run demo
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/adamabdo-xynora/${{ github.event.repository.name }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=sha
+          labels: |
+            org.opencontainers.image.description=RAG with receipts: per-claim provenance verified by exact quote containment, typed refusal when the corpus can't answer, and an eval gate that scores a correct refusal as a pass
+
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: runtime
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
