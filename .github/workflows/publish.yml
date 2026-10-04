@@ -44,6 +44,9 @@ jobs:
         uses: docker/metadata-action@v6
         with:
           images: ghcr.io/adamabdo-xynora/${{ github.event.repository.name }}
+          # A release tag is immutable; `latest` would drift off it. Only the
+          # version and the commit are published.
+          flavor: latest=false
           tags: |
             type=semver,pattern={{version}}
             type=sha
@@ -54,6 +57,11 @@ jobs:
         with:
           context: .
           target: runtime
+          # The gate above builds for the runner's native arch only, so the
+          # suite runs once, natively. The published image is both arches so
+          # the documented `docker pull` works on arm64 laptops without a
+          # --platform flag; arm64 here builds under QEMU.
+          platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
