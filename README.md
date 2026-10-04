@@ -70,6 +70,24 @@ Exit codes on the eval: 0 = gate PASS, 1 = gate FAIL, 2 = setup error. Each run 
     docker build -t rag-receipts .
     docker run --rm -e ANTHROPIC_API_KEY -e VOYAGE_API_KEY rag-receipts
 
+### Container image
+
+The runtime image is published to GHCR on every version tag, by a workflow whose gate runs the 240
+tests, the typecheck and the demo inside the test image first — the push step is unreachable unless
+all three pass.
+
+    docker pull --platform linux/amd64 ghcr.io/adamabdo-xynora/rag-receipts:0.1.0
+    docker run --rm --platform linux/amd64 \
+      -e ANTHROPIC_API_KEY -e VOYAGE_API_KEY ghcr.io/adamabdo-xynora/rag-receipts:0.1.0
+
+It runs the compiled eval CLI — the same entry point, the same exit codes, and the corpus and
+question set alongside it. `--help` prints the usage and exits 0; without keys it exits 2. Eval
+artifacts land in the container's `results/`, which is not mounted anywhere by default.
+
+`0.1.0` is `linux/amd64` only, which is why `--platform` appears above: on Apple Silicon the plain
+pull fails with `no matching manifest for linux/arm64/v8`. The workflow now publishes both arches,
+so the next tag will not need the flag.
+
 **What is live and what is not.** The demo is honest about this at every step, and so is this README. Corpus loading, chunking, cosine similarity, threshold partitioning, and every verification check are real computation, and the retrieval floor has been calibrated against live `voyage-4` embeddings (`docs/EVAL-RUN-2026-08-28.md`). Generation has not: the responses replayed in the demo are **hand-written fixtures, not recordings** — no model has answered a question in this repo — and they're labelled as such in the files and in the output. The adversarial payloads are hand-written to fail. The live path exists and is one command away; it just isn't what runs in CI.
 
 **Stack.** TypeScript throughout, Vitest, two runtime dependencies: the Anthropic SDK for generation, and nothing else — Voyage embeddings travel over raw `fetch` with an injected transport. Anthropic publishes no embedding model and names [Voyage](https://platform.claude.com/docs/en/build-with-claude/embeddings) as its recommended provider, which is why the stack pairs the two. The vector index is in-memory by design: the enforcement story lives entirely above the store, and a database dependency would obscure rather than demonstrate it. **Adapting to pgvector** means replacing `buildIndex` and `search` in `src/retrieve.ts` — the `Embedder` interface, the threshold partition, and everything downstream are unchanged.
