@@ -76,17 +76,22 @@ The runtime image is published to GHCR on every version tag, by a workflow whose
 tests, the typecheck and the demo inside the test image first — the push step is unreachable unless
 all three pass.
 
-    docker pull --platform linux/amd64 ghcr.io/adamabdo-xynora/rag-receipts:0.1.0
-    docker run --rm --platform linux/amd64 \
-      -e ANTHROPIC_API_KEY -e VOYAGE_API_KEY ghcr.io/adamabdo-xynora/rag-receipts:0.1.0
+    docker pull ghcr.io/adamabdo-xynora/rag-receipts:0.1.1
+    docker run --rm -e ANTHROPIC_API_KEY -e VOYAGE_API_KEY \
+      ghcr.io/adamabdo-xynora/rag-receipts:0.1.1
 
 It runs the compiled eval CLI — the same entry point, the same exit codes, and the corpus and
 question set alongside it. `--help` prints the usage and exits 0; without keys it exits 2. Eval
-artifacts land in the container's `results/`, which is not mounted anywhere by default.
+artifacts land in the container's `results/`, which is not mounted anywhere by default. `0.1.1` is
+published for `linux/amd64` and `linux/arm64`, so no `--platform` flag is needed on either.
 
-`0.1.0` is `linux/amd64` only, which is why `--platform` appears above: on Apple Silicon the plain
-pull fails with `no matching manifest for linux/arm64/v8`. The workflow now publishes both arches,
-so the next tag will not need the flag.
+The image carries signed build provenance, so you can check that these bytes came from this
+repository's CI rather than from someone with push access to the registry:
+
+    gh attestation verify oci://ghcr.io/adamabdo-xynora/rag-receipts:0.1.1 --owner adamabdo-xynora
+
+`0.1.0` remains published, `linux/amd64` only and without an attestation. Its digest has not changed
+and will not: a version that alters its bytes is not a version.
 
 **What is live and what is not.** The demo is honest about this at every step, and so is this README. Corpus loading, chunking, cosine similarity, threshold partitioning, and every verification check are real computation, and the retrieval floor has been calibrated against live `voyage-4` embeddings (`docs/EVAL-RUN-2026-08-28.md`). Generation has not: the responses replayed in the demo are **hand-written fixtures, not recordings** — no model has answered a question in this repo — and they're labelled as such in the files and in the output. The adversarial payloads are hand-written to fail. The live path exists and is one command away; it just isn't what runs in CI.
 
